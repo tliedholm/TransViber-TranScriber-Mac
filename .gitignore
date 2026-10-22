@@ -1,0 +1,60 @@
+# Python virtualenvs and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Vendored llama.cpp build
+llama-cpp/
+
+# Build output
+build/
+dist/
+packaging/build/
+packaging/dist/
+packaging/models/
+*.app
+*.dmg
+*.pkg
+
+# Logs
+*.log
+
+# Model weights
+*.gguf
+*.ct2
+*.bin
+*.pt
+*.safetensors
+*.npz
+*.mlpackage
+*.mlmodelc
+
+# Audio/video and transcripts
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.mp4
+*.mkv
+/output/
+/transcripts/
+
+# Secrets and signing files
+.env
+*.p12
+*.cer
+*.provisionprofile
+
+# Personal Claude Code settings
+.claude/settings.local.json
+
+# macOS and editor clutter
+.DS_Store
+._*
+Icon?
+*.swp
+*~
+.idea/
+.vscode/

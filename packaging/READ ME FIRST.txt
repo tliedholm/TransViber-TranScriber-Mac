@@ -1,0 +1,69 @@
+TransViber TransScriber 1.1 — for macOS
+=======================================
+
+Multi-track, speaker-aligned transcription that runs entirely on your Mac.
+Nothing is uploaded anywhere. No accounts, no API keys, no limits.
+
+Requires an Apple Silicon Mac (M1 or newer) on macOS 13 or later.
+Everything it needs is inside the app — there is nothing to install first.
+
+
+INSTALL
+-------
+
+1. Drag "TransViber TransScriber" onto the Applications shortcut in this
+   window.
+
+2. Open it from Launchpad or Spotlight (Cmd+Space, type TransViber).
+
+3. THE FIRST TIME ONLY, macOS will say the app "cannot be opened because
+   Apple cannot check it for malicious software." This is expected — it
+   just means the app is not registered with Apple's $99/yr developer
+   program. To open it:
+
+       - Click "Done" on that message.
+       - Open System Settings > Privacy & Security.
+       - Scroll down. There is a line about TransViber TransScriber being
+         blocked, with an "Open Anyway" button. Click it.
+       - Confirm with Touch ID or your password.
+
+   You only ever do this once. After that it opens like any other app.
+
+
+FIRST RUN
+---------
+
+The app is fully self-contained, but the AI models are not — they download
+the first time you use one, to ~/.cache/huggingface. Expect a few GB for
+the bigger models. After that they are local and work offline forever.
+
+The status bar shows download progress.
+
+
+USING IT
+--------
+
+1. Drag in one audio file per speaker. (A Craig or OBS multitrack recording
+   with everyone in one file works too — it is split automatically.)
+2. Rename the speakers.
+3. Pick a model. Good starting points:
+     - large-v3-turbo   fast, solid all-rounder
+     - qwen3-asr-1.7b   most accurate, 52 languages
+     - parakeet-tdt-0.6b-v3  fastest, 25 European languages
+       (parakeet-tdt-0.6b-v2 is the English-only one)
+4. Add Vocabulary hints for names the model won't know (character names,
+   place names). Works with Whisper and Qwen models.
+5. Transcribe. Then Export as Markdown, plain text, SRT, VTT or JSON.
+
+The Notes tab keeps your own notes alongside the transcript, and AI Notes
+can write a Markdown summary of the session using a local model.
+
+A 3-4 hour session across 4-5 speakers takes roughly 20-40 minutes with
+large-v3-turbo. Plug the laptop in; it will use the GPU hard.
+
+
+UNINSTALLING
+------------
+
+Drag the app to the Trash. To also remove the downloaded models, delete
+the folder ~/.cache/huggingface

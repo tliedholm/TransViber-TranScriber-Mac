@@ -1,0 +1,29 @@
+# Direct dependencies, pinned to the versions this Mac build is tested on.
+#
+# Why pin: these are eight fast-moving ML/UI projects. An unpinned install
+# gave a clean machine a different environment from the working one, and an
+# upstream API change could break model loading, word timestamps or packaging
+# with no change to this project's source. Transitive dependencies are left to
+# pip — the pins below are what the app talks to directly.
+#
+# Verified on: macOS 26 (Darwin 27), Apple silicon, Python 3.12.13, 2026-08-06.
+# Record the versions used for each released bundle alongside it.
+#
+# To move to newer versions: bump here, run
+#   .venv/bin/python -m pytest tests
+#   .venv/bin/python packaging/preflight.py
+# and rebuild + run the frozen self-test (packaging/build_app.sh) before
+# shipping. Note the new versions in this header when they pass.
+
+faster-whisper==1.2.1
+PySide6==6.11.1
+onnx-asr[hub]==0.11.0
+onnxruntime==1.27.0
+mlx-whisper==0.4.3
+mlx-qwen3-asr[aligner]==0.3.5
+mlx-lm==0.31.3
+psutil==7.2.2
+
+# Build and test only; excluded from the shipped bundle.
+pyinstaller==6.21.0
+pytest==9.1.1
