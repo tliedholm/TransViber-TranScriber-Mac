@@ -86,7 +86,21 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   Every pass is budgeted against the model's real context window
   (`context_window()` reads `model.args.max_position_embeddings` — 40,960
   for Qwen3 — and never trusts `tokenizer.model_max_length` alone), minus
-  the prompt and `MAX_NOTES_TOKENS` of output. `split_text()` splits at line
+  the whole request and `MAX_NOTES_TOKENS` of output. What a pass carries
+  besides its content (system text, user instructions, chat template,
+  Qwen3's thinking switch, Gemma's folded system turn) is measured once a
+  run by building that pass with empty content through `_request()`, the
+  same builder generation uses. `stream_generate` is handed `_request()`'s
+  ids, so what was counted is what runs; the direct prompt is counted whole
+  before it is sent. (The PC's `/tokenize` and character fallbacks have no
+  counterpart here: the tokenizer is in-process and is generation's own.)
+  Instructions that leave less than `MIN_PROMPT_TOKENS` of room fail the
+  run in `_budgets()` with a "shorten them" message, before the notes
+  header is written. The minimum is a check, never a floor: the old
+  1,000-token floor sent prompts bigger than the window. mlx-lm neither
+  truncates nor refuses an oversized prompt — it prefills all of it and
+  the model runs past its trained window, so the notes degrade with no
+  error — which makes this sizing the only guard. `split_text()` splits at line
   boundaries *and* at token boundaries within an over-long line, because
   `coalesce()` turns a monologue into one enormous line. The combine step is
   hierarchical: `batch_by_tokens()` groups part summaries into passes that
