@@ -56,8 +56,11 @@ earlier session is carried in.
     `large-v3-turbo` is roughly 5–10× faster than real time.
   - `qwen3-asr-1.7b` / `-0.6b` run through **mlx-qwen3-asr** on the Metal
     GPU (always, whatever Device says) — state-of-the-art accuracy,
-    52 languages, and vocabulary hints work. First use downloads the model
-    plus a small aligner model for word timestamps.
+    30 languages, and vocabulary hints work. Qwen3-ASR has no Norwegian or
+    Ukrainian, so those are greyed out while a Qwen model is selected, and
+    Transcribe asks for another choice if one of them was already picked.
+    First use downloads the model plus a small aligner model for word
+    timestamps.
   - `parakeet-tdt-0.6b-v2/v3` run through **onnx-asr on the CPU** whatever
     Device says — still very fast (about 15–20× real time), great English
     accuracy, no vocabulary-hint support. CoreML is deliberately not used:
