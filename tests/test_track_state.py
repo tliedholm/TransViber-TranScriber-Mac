@@ -72,3 +72,14 @@ def test_subtrack_labelling():
     assert track.is_subtrack
     assert track.source_label == "craig.flac [track 3, ch 1]"
     assert not Track(path=Path("/tmp/a.wav"), speaker="A").is_subtrack
+
+
+def test_a_decode_note_travels_with_its_transcript():
+    # "Done ⚠" belongs to the transcript it was found with: a failed rerun
+    # that restores that transcript restores its note too.
+    track = finished()
+    track.note = "Its timestamps jump back at 0:05."
+    track.stash_result()
+    track.note = ""                     # a fresh run starts without one
+    assert track.restore_result() is True
+    assert track.note == "Its timestamps jump back at 0:05."

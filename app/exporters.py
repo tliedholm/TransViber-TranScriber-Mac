@@ -90,6 +90,10 @@ def _track_entry(track: Track) -> dict:
         "channel": track.channel,
         "status": track.status.value,
     }
+    # What decoding ran into (timestamps that jump back, damaged packets):
+    # the words are all there, but times after it may be off.
+    if track.note:
+        entry["decode_note"] = track.note
     # The settings that made *this* track, not whatever the combo boxes hold
     # now: tracks can be transcribed across runs with different models.
     if track.config is not None:

@@ -103,6 +103,14 @@ def test_json_separates_failed_tracks():
     assert [s["text"] for s in data["segments"]] == ["a"]
 
 
+def test_json_says_what_decoding_ran_into():
+    noted = track("Alice", [(0, 1, "a")], note="Its timestamps jump back at 0:05.")
+    plain = track("Bob", [(1, 2, "b")])
+    data = json.loads(exporters.to_json(merge_tracks([noted, plain]), [noted, plain]))
+    assert data["tracks"][0]["decode_note"] == "Its timestamps jump back at 0:05."
+    assert "decode_note" not in data["tracks"][1]
+
+
 def test_export_all_writes_every_format(tmp_path):
     a = track("Alice", [(0, 1, "hello")])
     written = exporters.export_all(tmp_path / "out.md", merge_tracks([a]), [a])
