@@ -9,7 +9,7 @@ import pytest
 
 import exporters
 from merger import coalesce, discarded_segment_count, merge_tracks
-from models import RunConfig, Segment, Track, TrackStatus
+from models import OffsetSource, RunConfig, Segment, Track, TrackStatus
 
 
 def track(speaker, times, status=TrackStatus.DONE, **kwargs):
@@ -44,6 +44,65 @@ def test_cancelled_tracks_keep_their_partial_output():
     assert len(merge_tracks([done, stopped])) == 2
 
 
+# A track's offset is when its file began on the session clock.
+
+def test_an_offset_moves_every_segment_of_its_track():
+    bob = track("Bob", [(10.0, 12.0, "Hello.")], offset=900.0)
+    [seg] = merge_tracks([bob])
+    assert (seg.start, seg.end) == (910.0, 912.0)
+
+
+def test_ordering_across_tracks_follows_session_time():
+    # Bob joined five minutes late: his first line, a minute into his file,
+    # comes after Alice's line at 3:00 in hers.
+    alice = track("Alice", [(180.0, 181.0, "Three minutes in.")])
+    bob = track("Bob", [(60.0, 61.0, "Sorry I'm late.")], offset=300.0)
+    assert [s.speaker for s in merge_tracks([bob, alice])] == ["Alice", "Bob"]
+
+
+def test_the_offset_is_applied_once_and_tracks_keep_raw_times():
+    bob = track("Bob", [(1.0, 2.0, "Hi.")], offset=5.0)
+    first, second = merge_tracks([bob]), merge_tracks([bob])
+    assert [(s.start, s.end) for s in first] == [(s.start, s.end) for s in second]
+    assert (bob.segments[0].start, bob.segments[0].end) == (1.0, 2.0)
+
+
+def test_editing_the_merge_changes_no_track():
+    alice = track("Alice", [(0.0, 1.0, "Hi.")])
+    merge_tracks([alice])[0].text = "changed"
+    assert alice.segments[0].text == "Hi."
+
+
+def test_zero_offsets_keep_the_old_order_including_ties_and_overlaps():
+    a = track("A", [(1.0, 5.0, "a-long"), (6.0, 7.0, "a-later")])
+    b = track("B", [(1.0, 5.0, "b-tie"), (2.0, 3.0, "b-overlap")])
+    merged = merge_tracks([a, b])
+    assert [s.text for s in merged] == ["a-long", "b-tie", "b-overlap", "a-later"]
+    assert [(s.speaker, s.start, s.end) for s in merged] == [
+        ("A", 1.0, 5.0), ("B", 1.0, 5.0), ("B", 2.0, 3.0), ("A", 6.0, 7.0)]
+
+
+def test_offset_milliseconds_survive():
+    [seg] = merge_tracks([track("Bob", [(1.1, 2.4, "Hi.")], offset=150.25)])
+    assert seg.start == pytest.approx(151.35)
+    assert seg.end == pytest.approx(152.65)
+
+
+def test_offsets_reach_subtitle_times_through_the_merge():
+    bob = track("Bob", [(1.1, 2.4, "Hi.")], offset=150.25)
+    assert "00:02:31,350 --> 00:02:32,650" in exporters.to_srt(merge_tracks([bob]))
+    assert "00:02:31.350 --> 00:02:32.650" in exporters.to_vtt(merge_tracks([bob]))
+
+
+def test_json_records_each_tracks_offset_and_how_it_was_set():
+    alice = track("Alice", [(0, 1, "a")])
+    bob = track("Bob", [], offset=312.4567, offset_source=OffsetSource.MANUAL)
+    data = json.loads(exporters.to_json(merge_tracks([alice, bob]), [alice, bob]))
+    assert (data["tracks"][0]["offset"], data["tracks"][0]["offset_source"]) == (0.0, "default")
+    assert (data["tracks"][1]["offset"], data["tracks"][1]["offset_source"]) == (312.457,
+                                                                                 "manual")
+
+
 def test_coalesce_joins_consecutive_same_speaker():
     segments = [Segment("Alice", 0, 1, "one"), Segment("Alice", 1, 2, "two"),
                 Segment("Bob", 2, 3, "three")]
@@ -75,6 +134,11 @@ def test_vtt_escapes_the_cue_tag():
     assert "a &gt; b &amp; c" in out
     # A raw '>' inside the name would have closed the tag early.
     assert "<v R&B <Ana>>" not in out
+
+
+def test_readable_timestamps_drop_a_zero_hour():
+    assert exporters.hms(75) == "1:15"
+    assert exporters.hms(3675) == "1:01:15"
 
 
 def test_srt_and_vtt_timestamps():

@@ -6,7 +6,13 @@ from models import Segment, Track, TrackStatus
 
 
 def merge_tracks(tracks: list[Track], include_failed: bool = False) -> list[Segment]:
-    """All segments from all usable tracks, ordered by start time.
+    """All segments from all usable tracks, on the session clock, ordered by start time.
+
+    Segment times inside a track are relative to its own file; each track's
+    offset is added here, to copies, so the tracks keep their raw times and
+    the offset can never be applied twice — however often this runs or the
+    offset changes. What this returns is a view: editing it changes no
+    track. Python's sort is stable, so exact ties keep track order.
 
     An engine can emit segments and *then* raise: those partial segments are
     a fragment of one speaker's audio, and letting them into the merged
@@ -15,7 +21,7 @@ def merge_tracks(tracks: list[Track], include_failed: bool = False) -> list[Segm
     but are kept out of the transcript and every export unless asked for.
     """
     segments = [
-        seg
+        Segment(seg.speaker, seg.start + track.offset, seg.end + track.offset, seg.text)
         for track in tracks
         if include_failed or track.status != TrackStatus.ERROR
         for seg in track.segments

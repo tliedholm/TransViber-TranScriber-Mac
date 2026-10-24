@@ -55,6 +55,12 @@ USING IT
    place names). Works with Whisper and Qwen models.
 5. Transcribe. Then Export as Markdown, plain text, SRT, VTT or JSON.
 
+If someone recorded separately and joined late, type when their file
+started into their track's Offset cell (e.g. 2:30). Align... can work it
+out from sound the recordings share, such as a recording of the whole
+call added as a session reference; nothing changes until you tick the
+suggestions and press Apply.
+
 The Notes tab keeps your own notes alongside the transcript, and AI Notes
 can write a Markdown summary of the session using a local model.
 

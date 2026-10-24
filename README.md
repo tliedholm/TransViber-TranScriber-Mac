@@ -16,6 +16,9 @@ that way: podcasts, interviews, meetings.
 - **Speaker-aligned merge.** Segments are split at pauses in speech and
   sorted by time, so cross-talk interleaves correctly instead of each speaker
   arriving as one block.
+- **Offset and Align** for someone who joined late or recorded on another
+  device: type when their file began, or let Align suggest it from sound
+  the recordings share.
 - **Vocabulary hints** for names the model wouldn't know (characters, places,
   jargon).
 - **AI Notes**: a local LLM (via mlx-lm) writes a Markdown session summary,
@@ -87,10 +90,18 @@ through installing it.
    device that actually ran, model-download progress, and GPU/CPU/RAM load.
 6. **Export…** as Markdown, plain text, SRT, WebVTT, JSON, or all five at
    once. Markdown and text merge consecutive lines from the same speaker;
-   JSON also records, per track, the model and backend that produced it.
+   JSON also records, per track, the model and backend that produced it and
+   its offset.
 
-All tracks are assumed to start at the same moment, which is how multitrack
-recorders such as Craig write them.
+Multitrack recorders such as Craig start every track at the same moment, so
+every **Offset** stays at `0:00`. When a file began later (someone joined
+late, or recorded on their own device), type when it began in its Offset
+cell (`150`, `2:30` or `1:02:30`). The transcript, AI Notes and exports
+follow straight away, with no re-transcription. **Align…** can suggest the
+offsets from sound the files share, or from a full-session mix added as the
+session reference, which is used for timing only and never transcribed.
+Nothing changes until you tick its suggestions and press Apply.
+[`README-MAC.md`](README-MAC.md) has the details.
 
 ### Notes tab
 
@@ -191,8 +202,9 @@ A few things worth knowing:
   below, and note the versions in that file's header.
 - `CLAUDE.md` describes the architecture and the invariants that must not be
   broken (word-gap splitting, hallucination guards, decoding on the file's
-  own clock, reporting the backend that actually ran, and more). Read it
-  before changing the engines, audio decoding or the merge.
+  own clock, offsets living in one place, reporting the backend that
+  actually ran, and more). Read it before changing the engines, audio
+  decoding, the merge or Align.
 
 ### Building the app
 
@@ -223,10 +235,11 @@ app/
   main_window.py   the whole UI: Transcribe and Notes tabs, settings
   transcriber.py   TranscribeWorker and the four engine paths, backend resolution
   audio.py         PyAV decoding to 16 kHz mono on the file's own clock; multitrack expansion
-  merger.py        chronological merge and same-speaker coalescing
+  align.py         the Offset column's parsing, and Align: offsets from shared sound
+  merger.py        chronological merge (with each track's offset) and same-speaker coalescing
   exporters.py     md / txt / srt / vtt / json
   llm.py           AI Notes (mlx-lm), context-window budgeting, part/combine passes
-  models.py        Track, Segment and RunConfig
+  models.py        Track, Segment, RunConfig and SessionReference
   stats.py         GPU/CPU/RAM poller for the status bar
   diagnostics.py   rotating log file
 packaging/         build_app.sh, PyInstaller specs, preflight and frozen self-test

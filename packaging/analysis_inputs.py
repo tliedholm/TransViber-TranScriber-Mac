@@ -54,6 +54,7 @@ HIDDEN_IMPORTS = [
     "llm",
     "stats",
     "audio",
+    "align",
     "merger",
     "exporters",
     "models",

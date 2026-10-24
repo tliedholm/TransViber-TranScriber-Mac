@@ -30,7 +30,9 @@ def _vtt(text: str) -> str:
             .replace(">", "&gt;"))
 
 
-def _hms(seconds: float) -> str:
+def hms(seconds: float) -> str:
+    """Whole seconds as `m:ss`, or `h:mm:ss` from an hour: the clock the
+    track table, the transcript and the text exports all show."""
     s = int(seconds)
     h, rem = divmod(s, 3600)
     m, s = divmod(rem, 60)
@@ -52,7 +54,7 @@ def _ts_vtt(seconds: float) -> str:
 def to_markdown(segments: list[Segment]) -> str:
     lines = ["# Transcript", ""]
     for seg in coalesce(segments):
-        lines.append(f"**{_md(seg.speaker)}** \\[{_hms(seg.start)}\\]: {seg.text}")
+        lines.append(f"**{_md(seg.speaker)}** \\[{hms(seg.start)}\\]: {seg.text}")
         lines.append("")
     return "\n".join(lines)
 
@@ -60,7 +62,7 @@ def to_markdown(segments: list[Segment]) -> str:
 def to_text(segments: list[Segment]) -> str:
     lines = []
     for seg in coalesce(segments):
-        lines.append(f"[{_hms(seg.start)}] {seg.speaker}: {seg.text}")
+        lines.append(f"[{hms(seg.start)}] {seg.speaker}: {seg.text}")
         lines.append("")
     return "\n".join(lines)
 
@@ -92,6 +94,10 @@ def _track_entry(track: Track) -> dict:
         "language": track.language,
         "stream": track.stream_index,
         "channel": track.channel,
+        # Segment times are session times: this track's own file times plus
+        # this offset.
+        "offset": round(track.offset, 3),
+        "offset_source": track.offset_source.value,
         "status": track.status.value,
     }
     # What decoding ran into (timestamps that jump back, damaged packets):
