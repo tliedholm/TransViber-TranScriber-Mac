@@ -802,6 +802,7 @@ def test_quitting_stops_a_running_alignment_and_waits_for_it(s):
                 time.sleep(0.01)
             inner.cancelled = True
 
+    w.show()
     with patch("main_window.AlignWorker", Reading):
         w.toggle_alignment()
     worker = w.align_worker
@@ -809,5 +810,9 @@ def test_quitting_stops_a_running_alignment_and_waits_for_it(s):
     event = QCloseEvent()
     w.closeEvent(event)
     assert worker._stop
-    assert event.isAccepted()
+    # Align is a job like the others: the close waits for its finish
+    # handler, which drops the worker and completes the quit.
+    assert not event.isAccepted()
+    _wait_until(lambda: not w.isVisible())
+    assert w.align_worker is None
     assert not worker.isRunning()     # never destroyed while its thread is alive

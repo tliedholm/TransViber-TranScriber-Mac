@@ -156,7 +156,11 @@ try:
     from mlx_lm import load
     model, tok = load(llm.LLM_REPOS["qwen3-4b"])
     notes_ok = model is not None and tok is not None
-    print(f"loaded qwen3-4b OK (context {llm.context_window(model, tok)})")
+    context = llm.context_window(model, tok)
+    # Sizes every pass through the real chat template, as a notes run does.
+    room = min(llm.NotesWorker("", "", "qwen3-4b")._budgets(tok, context))
+    print(f"loaded qwen3-4b OK (context {context}, {room:,} tokens of "
+          f"transcript per pass)")
     del model, tok
 except Exception:
     print("FAILED")

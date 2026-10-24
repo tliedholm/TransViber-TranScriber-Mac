@@ -14,12 +14,15 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   `.venv/bin/python app/main.py`.
 - Tests: `.venv/bin/python -m pytest tests` (fast; no models or downloads;
   `test_align.py`'s synthetic sessions take most of the ~25 s).
-  `tests/test_track_status.py` and `tests/test_offset_and_align_window.py`
-  build a real `MainWindow` offscreen, with settings in a scratch file and
-  no stats thread; a new window test should delete its window explicitly,
-  since PySide6 6.11 can crash collecting a closed one. The Align window
-  tests run the real `AlignWorker` thread with `run()` scripted and play the
-  review window by replacing only its `exec()`.
+  `tests/test_track_status.py`, `tests/test_window_lifecycle.py` and
+  `tests/test_offset_and_align_window.py` build a real `MainWindow`
+  offscreen, with settings in a scratch file; a new window test should
+  delete its window explicitly, since PySide6 6.11 can crash collecting a
+  closed one. `test_window_lifecycle` covers the export
+  warning and failure reports, and closing with unsaved notes — including
+  a real notes thread whose last chunks are still queued when it stops.
+  The Align window tests run the real `AlignWorker` thread with `run()`
+  scripted and play the review window by replacing only its `exec()`.
   Environment check: `.venv/bin/python packaging/preflight.py`.
 - Dependency versions are pinned in `requirements-mac.txt`; bump there and
   re-run tests + preflight + the frozen self-test before shipping.
@@ -52,7 +55,11 @@ to stay compatible with Windows, but the user may ask to port fixes across.
 - `main_window.py` — all UI. Transcribe tab (track table with an editable
   **Offset** column, **Align…**, the optional session-reference row above
   the table), live merged transcript, and Notes tab with autosaved
-  manual/local-AI notes.
+  manual/local-AI notes. The notes live in
+  QSettings (`"notes"`); `_save_notes` syncs and checks `status()` so a
+  failed write is reported, never assumed. `_notes_dirty` is set by every
+  change, typed or streamed, and cleared only by a save that succeeded, so
+  untouched notes are never rewritten and a failed save is never forgotten.
   `IS_MAC` switches the Device combo to "GPU (Metal)" (`"mlx"`) / CPU.
   Settings (model, language, vocab hints) persist via QSettings.
 - `diagnostics.py` — rotating log at
@@ -102,7 +109,21 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   Every pass is budgeted against the model's real context window
   (`context_window()` reads `model.args.max_position_embeddings` — 40,960
   for Qwen3 — and never trusts `tokenizer.model_max_length` alone), minus
-  the prompt and `MAX_NOTES_TOKENS` of output. `split_text()` splits at line
+  the whole request and `MAX_NOTES_TOKENS` of output. What a pass carries
+  besides its content (system text, user instructions, chat template,
+  Qwen3's thinking switch, Gemma's folded system turn) is measured once a
+  run by building that pass with empty content through `_request()`, the
+  same builder generation uses. `stream_generate` is handed `_request()`'s
+  ids, so what was counted is what runs; the direct prompt is counted whole
+  before it is sent. (The PC's `/tokenize` and character fallbacks have no
+  counterpart here: the tokenizer is in-process and is generation's own.)
+  Instructions that leave less than `MIN_PROMPT_TOKENS` of room fail the
+  run in `_budgets()` with a "shorten them" message, before the notes
+  header is written. The minimum is a check, never a floor: the old
+  1,000-token floor sent prompts bigger than the window. mlx-lm neither
+  truncates nor refuses an oversized prompt — it prefills all of it and
+  the model runs past its trained window, so the notes degrade with no
+  error — which makes this sizing the only guard. `split_text()` splits at line
   boundaries *and* at token boundaries within an over-long line, because
   `coalesce()` turns a monologue into one enormous line. The combine step is
   hierarchical: `batch_by_tokens()` groups part summaries into passes that
@@ -138,6 +159,16 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   partial segments would make an incomplete track read as finished. They
   stay on the Track (the UI reports the count) but never reach the
   transcript or an export. Speaker names are escaped per format.
+  Export first warns about every track that isn't Done
+  (`_missing_from_export`): failed (left out whole), cancelled (partial or
+  empty) and never transcribed alike; a Done track with no segments is
+  silent audio and doesn't count. Every export, Export Notes included,
+  stages each file beside its target (unique name, fsynced, the replaced
+  file's permissions or the umask's — not mkstemp's 0o600) before renaming
+  any into place, so a failure never half-writes a file. A rename that
+  fails raises `ExportError` (an `OSError`) naming the files already new
+  and the ones still old. Five renames are not one transaction; don't let
+  a docstring claim they are.
 
 ## Critical invariants — do not break
 
@@ -206,7 +237,17 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   transcribes a whole track in one blocking call, a Qwen region runs up to
   240 s, and downloads are unbounded — none can be interrupted. `closeEvent`
   defers the close and `_quit_if_idle()` completes it; "Quit now" uses
-  `os._exit(0)` rather than tearing down a live `QThread`.
+  `os._exit(0)` rather than tearing down a live `QThread`. A job counts as
+  over once its finish handler has run (it drops the window's reference),
+  not when `isRunning()` turns false: the last notes chunks are still
+  queued behind a finished thread. `QThread.finished` is the backstop for a
+  run that dies without its finish signal (`_on_thread_finished`).
+- **A close never loses notes it could not write.** Only once every job is
+  over are the notes saved for the last time; if that save fails (or the
+  notes can't be saved before "Quit now"), one prompt offers Retry / Save
+  Elsewhere / Return to App / Close Without Saving. Return to App calls the
+  quit off with the stats poller and autosave still running, and the
+  finish handlers reset their controls even while quitting.
 - **No ffmpeg CLI**: all decoding goes through PyAV (`decode_track_audio`).
   Never hand mlx-whisper a file path — its loader shells out to an `ffmpeg`
   binary that is not installed here and is absent from the shipped `.app`;
