@@ -918,6 +918,7 @@ class MainWindow(QMainWindow):
             track.stash_result()
             track.status = TrackStatus.PENDING
             track.error = ""
+            track.note = ""
             self._set_status(i, track.status.value)
             self._progress_bar(i).setValue(0)
 
@@ -936,6 +937,7 @@ class MainWindow(QMainWindow):
         w.track_progress.connect(lambda i, p: self._progress_bar(i).setValue(p))
         w.track_done.connect(self._on_track_done)
         w.track_failed.connect(self._on_track_failed)
+        w.track_note.connect(self._on_track_note)
         w.finished_all.connect(self._on_finished)
         llm.free_llm()  # ASR and notes LLM never share memory
         diagnostics.log_event("transcription started", model=wanted.model,
@@ -982,6 +984,7 @@ class MainWindow(QMainWindow):
     def _on_track_started(self, i: int) -> None:
         track = self.tracks[i]
         track.segments.clear()  # a CPU-fallback retry restarts the track from scratch
+        track.note = ""
         track.status = TrackStatus.TRANSCRIBING
         self._set_status(i, TrackStatus.TRANSCRIBING.value)
         self._progress_bar(i).setValue(0)
@@ -996,9 +999,15 @@ class MainWindow(QMainWindow):
     def _show_done(self, i: int) -> None:
         track = self.tracks[i]
         label = TrackStatus.DONE.value + (f" ({track.language})" if track.language else "")
-        self._set_status(i, label)
-        self.table.item(i, COL_STATUS).setToolTip(
-            track.config.summary() if track.config else "")
+        self._set_status(i, label + (" ⚠" if track.note else ""))
+        tip = [track.config.summary()] if track.config else []
+        if track.note:
+            tip.append(track.note)
+        self.table.item(i, COL_STATUS).setToolTip("\n\n".join(tip))
+
+    @Slot(int, str)
+    def _on_track_note(self, i: int, note: str) -> None:
+        self.tracks[i].note = note
 
     @Slot(int, str, object)
     def _on_track_done(self, i: int, language: str, config) -> None:
@@ -1017,8 +1026,10 @@ class MainWindow(QMainWindow):
         if track.restore_result():
             # A rerun failed, but the earlier successful transcript survived.
             self._show_done(i)
-            self.table.item(i, COL_STATUS).setToolTip(
-                f"The rerun failed; the previous transcript was kept.\n\n{message}")
+            tip = f"The rerun failed; the previous transcript was kept.\n\n{message}"
+            if track.note:
+                tip += f"\n\n{track.note}"
+            self.table.item(i, COL_STATUS).setToolTip(tip)
             self._schedule_refresh()
             return
         track.status = TrackStatus.ERROR

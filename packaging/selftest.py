@@ -76,6 +76,7 @@ def run_engine(label: str, model_name: str, device: str) -> None:
     segments = []
     status = []
     failures = []
+    notes = []
 
     worker = transcriber.TranscribeWorker(
         tracks=[Track(path=AUDIO, speaker="Alice")],
@@ -88,6 +89,7 @@ def run_engine(label: str, model_name: str, device: str) -> None:
     worker.segment_ready.connect(lambda i, s: segments.append(s))
     worker.model_status.connect(status.append)
     worker.track_failed.connect(lambda i, m: failures.append(m))
+    worker.track_note.connect(lambda i, m: notes.append(m))  # decoding's timing notes
 
     expected = transcriber.resolve_backend(model_name, device)
     t0 = time.time()
@@ -106,7 +108,7 @@ def run_engine(label: str, model_name: str, device: str) -> None:
     text = " ".join(s.text.strip() for s in segments)
     ok = bool(text) and not failures and not wrong_backend
 
-    results.append((label, ok, elapsed, text, failures, expected, actual, status))
+    results.append((label, ok, elapsed, text, failures, expected, actual, status, notes))
     transcriber.free_asr_models()
 
 
@@ -162,7 +164,7 @@ except Exception:
 
 print("=" * 70)
 all_ok = notes_ok and not bundle_problems
-for label, ok, elapsed, text, failures, expected, actual, status in results:
+for label, ok, elapsed, text, failures, expected, actual, status, notes in results:
     all_ok = all_ok and ok
     print(f"[{'PASS' if ok else 'FAIL'}] {label}  ({elapsed:.1f}s)")
     print(f"       backend: {actual.label if actual else 'none'}")
@@ -171,6 +173,8 @@ for label, ok, elapsed, text, failures, expected, actual, status in results:
         print(f"       !! expected {expected.label}, got {actual.label}")
     for f in failures:
         print(f"       !! {f.splitlines()[-1] if f else f}")
+    for n in notes:
+        print(f"       note: {n}")
     for s in status:
         if "fail" in s.lower() or "error" in s.lower():
             print(f"       !! status: {s}")

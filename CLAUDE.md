@@ -13,6 +13,10 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   Launch: `./TransViber TransScriber.command` or
   `.venv/bin/python app/main.py`.
 - Tests: `.venv/bin/python -m pytest tests` (fast; no models or downloads).
+  `tests/test_track_status.py` builds a real `MainWindow` offscreen, with
+  settings in a scratch file and no stats thread; a new window test should
+  delete its window explicitly, since PySide6 6.11 can crash collecting a
+  closed one.
   Environment check: `.venv/bin/python packaging/preflight.py`.
 - Dependency versions are pinned in `requirements-mac.txt`; bump there and
   re-run tests + preflight + the frozen self-test before shipping.
@@ -109,7 +113,9 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   CPU/RAM via psutil. Polls off the main thread because ioreg takes ~50 ms.
 - `audio.py` — `tracks_for_file()` expands multitrack files (multiple audio
   streams -> track per stream; >2 channels -> track per channel; stereo split
-  is a right-click action). `decode_track_audio()` -> mono float32 16 kHz.
+  is a right-click action). `decode_track_audio()` -> mono float32 16 kHz,
+  on the file's own clock (see the invariants), reporting what it ran into
+  in a `Timing`.
 - `merger.py` / `exporters.py` — chronological merge, same-speaker
   coalescing, and md/txt/srt/vtt/json exporters. `merge_tracks()` skips
   `ERROR` tracks: an engine can emit segments and *then* raise, and those
@@ -133,6 +139,27 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   can make Qwen repeat text and corrupt forced-aligned timestamps.
 - All tracks are assumed to start at the same instant (multitrack recorder
   convention); merging is a sort by segment start time.
+- **Decode on the file's own clock.** Every engine, faster-whisper included,
+  is handed `decode_track_audio`'s array, never a path: faster-whisper's own
+  decoder lays audio end to end, so a stream that began late in its file
+  lands at 0:00 and everything after a gap in the timestamps moves earlier,
+  which breaks the same-instant rule above. `audio.py` measures every stream
+  in a file from one 0:00 (`container.start_time`, or the earliest packet
+  timestamp when the file declares none) and places each run of frames by
+  its timestamp: within `TIMING_TOLERANCE` (20 ms) it follows on; later is a
+  gap filled with silence (the resampler is restarted so it never blends
+  across one); earlier plays on from where the audio had got to and is
+  noted as a jump back, so no audio is dropped. A packet that won't decode
+  is skipped and counted. Silence is made up only to `MAX_TIMELINE_SECONDS`
+  (24 h). Ordinary files decode sample for sample as before (checked on
+  flac, m4a, mp3, ogg, opus, wav, mka, webm).
+  What decoding ran into reaches the track as `Track.note` via the worker's
+  `track_note` signal: "Done ⚠" with the note in the Status tooltip,
+  `decode_note` in the JSON export, `note:` lines in the self-test. The note
+  is stashed and restored with the transcript it came with. An
+  `AudioFileError` is the file's own problem, so the worker fails that track
+  without the fallback retry, which would read it no better and leave every
+  later track off the GPU.
 - **Never report the requested device as the one that ran.** Qwen ignores
   Device, onnx on a Mac ignores it, and Whisper ignores it without
   mlx-whisper. Everything user-facing (status bar, JSON export, self-test)
