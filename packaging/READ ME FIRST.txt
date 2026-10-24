@@ -48,7 +48,7 @@ USING IT
 2. Rename the speakers.
 3. Pick a model. Good starting points:
      - large-v3-turbo   fast, solid all-rounder
-     - qwen3-asr-1.7b   most accurate, 52 languages
+     - qwen3-asr-1.7b   most accurate, 30 languages
      - parakeet-tdt-0.6b-v3  fastest, 25 European languages
        (parakeet-tdt-0.6b-v2 is the English-only one)
 4. Add Vocabulary hints for names the model won't know (character names,

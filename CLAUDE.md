@@ -65,6 +65,13 @@ to stay compatible with Windows, but the user may ask to port fixes across.
      timestamps come from `ForcedAligner` (Qwen3-ForcedAligner-0.6B), loaded
      once in `_QwenModel` and passed per call. Vocab hints -> `context=`;
      language codes map to full names via `QWEN_LANGUAGE_NAMES`.
+     Its languages are a closed list: `QWEN_LANGUAGE_NAMES` holds only names
+     in the model's own `support_languages` (no Norwegian or Ukrainian).
+     mlx-qwen3-asr does not enforce that list (it warns on stderr and forces
+     the name into the prompt), so `language_supported` is checked twice:
+     the window greys out what the chosen model lacks and refuses a
+     selection it already had, never turning it into auto-detect, and
+     `TranscribeWorker.run` refuses it before any model loads.
   `resolve_backend(model, device)` decides which of the four actually runs
   and returns a `Backend(engine, device)`; `_get_model` branches on that
   same value, so the path taken and the path reported cannot disagree.
