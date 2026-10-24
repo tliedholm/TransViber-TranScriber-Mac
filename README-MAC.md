@@ -34,8 +34,10 @@ Transcribe, Export. Vocabulary hints work with Whisper models for D&D names.
 The **Notes** tab mirrors the merged transcript and keeps manually entered
 notes autosaved on this Mac. **AI Notes** uses a downloadable local MLX model
 to write Markdown summaries; its optional instructions are added to the
-built-in summary prompt. ASR and notes models are unloaded before the other
-kind starts so they do not compete for unified memory.
+built-in summary prompt. Instructions so long that they leave the model too
+little room for the transcript are refused with a message saying to shorten
+them, before anything is written. ASR and notes models are unloaded before
+the other kind starts so they do not compete for unified memory.
 
 AI Notes are laid out as: summary, key points and decisions, memorable
 moments, open questions, then **Per-person summary** (each speaker and any
