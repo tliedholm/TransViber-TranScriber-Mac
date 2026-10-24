@@ -241,7 +241,8 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   over once its finish handler has run (it drops the window's reference),
   not when `isRunning()` turns false: the last notes chunks are still
   queued behind a finished thread. `QThread.finished` is the backstop for a
-  run that dies without its finish signal (`_on_thread_finished`).
+  run that dies without its finish signal (`_on_thread_finished`). Align's
+  finish handler, `_on_align_finished`, is its `QThread.finished` itself.
 - **A close never loses notes it could not write.** Only once every job is
   over are the notes saved for the last time; if that save fails (or the
   notes can't be saved before "Quit now"), one prompt offers Retry / Save
