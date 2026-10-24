@@ -40,7 +40,13 @@ from llm import DEFAULT_NOTES_MODEL, NOTES_MODEL_GROUPS, NotesWorker
 from merger import coalesce, discarded_segment_count, merge_tracks
 from models import AUDIO_EXTENSIONS, RunConfig, Track, TrackStatus
 from stats import StatsPoller
-from transcriber import TranscribeWorker, cuda_available, engine_for, mlx_available
+from transcriber import (
+    TranscribeWorker,
+    cuda_available,
+    engine_for,
+    language_supported,
+    mlx_available,
+)
 
 IS_MAC = sys.platform == "darwin"
 
@@ -183,9 +189,9 @@ class MainWindow(QMainWindow):
             "'.en' models are English-only and slightly more accurate for English.\n"
             "\n"
             "Qwen models (via mlx-qwen3-asr, Apple GPU only): qwen3-asr-1.7b —\n"
-            "state-of-the-art accuracy, 52 languages, supports vocabulary\n"
-            "hints. -0.6b is the faster, lighter sibling. The Device setting\n"
-            "is ignored (always Metal GPU).\n"
+            "state-of-the-art accuracy, 30 languages (no Norwegian or\n"
+            "Ukrainian), supports vocabulary hints. -0.6b is the faster,\n"
+            "lighter sibling. The Device setting is ignored (always Metal GPU).\n"
             "\n"
             "NVIDIA models (via onnx-asr): parakeet-tdt-0.6b-v2 (English) and\n"
             "-v3 (25 European languages) — faster than Whisper, top English\n"
@@ -201,6 +207,12 @@ class MainWindow(QMainWindow):
         for name, code in LANGUAGES:
             self.combo_lang.addItem(name, code)
         bar.addWidget(self.combo_lang)
+        # Shown while the chosen language is one the model can't take.
+        self.label_lang_conflict = QLabel("⚠ Not supported")
+        self.label_lang_conflict.hide()
+        bar.addWidget(self.label_lang_conflict)
+        self.combo_model.currentTextChanged.connect(self._update_language_choices)
+        self.combo_lang.currentIndexChanged.connect(self._update_language_choices)
 
         bar.addWidget(QLabel("Device:"))
         self.combo_device = QComboBox()
@@ -377,6 +389,32 @@ class MainWindow(QMainWindow):
         model = self.combo_model.currentText().strip()
         self.hints_widget.setVisible(engine_for(model) in ("whisper", "qwen"))
 
+    def _update_language_choices(self) -> None:
+        """Grey out the languages the chosen model can't take.
+
+        One that is already selected stays selected and is flagged, rather
+        than quietly becoming Auto-detect, which would change what was asked
+        for; Transcribe refuses it until the language or model changes.
+        """
+        model = self.combo_model.currentText().strip()
+        items = self.combo_lang.model()
+        for row in range(self.combo_lang.count()):
+            supported = language_supported(model, self.combo_lang.itemData(row))
+            items.item(row).setEnabled(supported)
+            items.item(row).setToolTip("" if supported else f"Not supported by {model}.")
+        conflict = self._language_conflict()
+        self.label_lang_conflict.setToolTip(conflict or "")
+        self.label_lang_conflict.setVisible(conflict is not None)
+
+    def _language_conflict(self) -> str | None:
+        """Why the chosen model can't take the chosen language, or None."""
+        model = self.combo_model.currentText().strip()
+        if language_supported(model, self.combo_lang.currentData()):
+            return None
+        language = self.combo_lang.currentText()
+        return (f"{model} can't transcribe {language}. Choose another language "
+                f"or Auto-detect, or a Whisper model for {language}.")
+
     def _make_star_button(self, combo: QComboBox, settings_key: str) -> QPushButton:
         """Flat ☆/★ toggle pinning the combo's current model as startup default."""
         btn = QPushButton("☆")
@@ -546,7 +584,7 @@ class MainWindow(QMainWindow):
         settings = QSettings()
         settings.setValue("notes", self.notes_edit.toPlainText())
         settings.sync()
-        if settings.status() != QSettings.Status.NoError:
+        if settings.status() != settings.Status.NoError:
             self._notes_save_error = (
                 f"The settings file could not be written: {settings.fileName()}")
             self.statusBar().showMessage(
@@ -921,6 +959,11 @@ class MainWindow(QMainWindow):
         if not self.tracks:
             QMessageBox.information(self, "No tracks", "Add at least one audio track first.")
             return
+        # Before asking which tracks to run, so nothing is asked and then refused.
+        conflict = self._language_conflict()
+        if conflict is not None:
+            QMessageBox.warning(self, "Language not supported", conflict)
+            return
 
         wanted = self._current_config()
         indices = self._indices_to_run(wanted)
@@ -934,6 +977,7 @@ class MainWindow(QMainWindow):
             track.stash_result()
             track.status = TrackStatus.PENDING
             track.error = ""
+            track.note = ""
             self._set_status(i, track.status.value)
             self._progress_bar(i).setValue(0)
 
@@ -952,6 +996,7 @@ class MainWindow(QMainWindow):
         w.track_progress.connect(lambda i, p: self._progress_bar(i).setValue(p))
         w.track_done.connect(self._on_track_done)
         w.track_failed.connect(self._on_track_failed)
+        w.track_note.connect(self._on_track_note)
         w.finished_all.connect(self._on_finished)
         w.finished.connect(self._on_thread_finished)
         llm.free_llm()  # ASR and notes LLM never share memory
@@ -999,6 +1044,7 @@ class MainWindow(QMainWindow):
     def _on_track_started(self, i: int) -> None:
         track = self.tracks[i]
         track.segments.clear()  # a CPU-fallback retry restarts the track from scratch
+        track.note = ""
         track.status = TrackStatus.TRANSCRIBING
         self._set_status(i, TrackStatus.TRANSCRIBING.value)
         self._progress_bar(i).setValue(0)
@@ -1013,9 +1059,15 @@ class MainWindow(QMainWindow):
     def _show_done(self, i: int) -> None:
         track = self.tracks[i]
         label = TrackStatus.DONE.value + (f" ({track.language})" if track.language else "")
-        self._set_status(i, label)
-        self.table.item(i, COL_STATUS).setToolTip(
-            track.config.summary() if track.config else "")
+        self._set_status(i, label + (" ⚠" if track.note else ""))
+        tip = [track.config.summary()] if track.config else []
+        if track.note:
+            tip.append(track.note)
+        self.table.item(i, COL_STATUS).setToolTip("\n\n".join(tip))
+
+    @Slot(int, str)
+    def _on_track_note(self, i: int, note: str) -> None:
+        self.tracks[i].note = note
 
     @Slot(int, str, object)
     def _on_track_done(self, i: int, language: str, config) -> None:
@@ -1034,8 +1086,10 @@ class MainWindow(QMainWindow):
         if track.restore_result():
             # A rerun failed, but the earlier successful transcript survived.
             self._show_done(i)
-            self.table.item(i, COL_STATUS).setToolTip(
-                f"The rerun failed; the previous transcript was kept.\n\n{message}")
+            tip = f"The rerun failed; the previous transcript was kept.\n\n{message}"
+            if track.note:
+                tip += f"\n\n{track.note}"
+            self.table.item(i, COL_STATUS).setToolTip(tip)
             self._schedule_refresh()
             return
         track.status = TrackStatus.ERROR
@@ -1234,6 +1288,7 @@ class MainWindow(QMainWindow):
         if lang_index >= 0:
             self.combo_lang.setCurrentIndex(lang_index)
         self._update_hints_visibility()
+        self._update_language_choices()
         # Loading is not a change: it must not mark the notes unsaved or
         # schedule a rewrite of what was just read.
         self.notes_edit.blockSignals(True)

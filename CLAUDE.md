@@ -13,12 +13,12 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   Launch: `./TransViber TransScriber.command` or
   `.venv/bin/python app/main.py`.
 - Tests: `.venv/bin/python -m pytest tests` (fast; no models or downloads).
-  `test_window_lifecycle.py` drives the real window offscreen
-  (`QT_QPA_PLATFORM=offscreen`, settings in a temp INI): the export
+  `tests/test_track_status.py` and `tests/test_window_lifecycle.py` build a
+  real `MainWindow` offscreen, with settings in a scratch file; a new window
+  test should delete its window explicitly, since PySide6 6.11 can crash
+  collecting a closed one. `test_window_lifecycle` covers the export
   warning and failure reports, and closing with unsaved notes — including
   a real notes thread whose last chunks are still queued when it stops.
-  Each test deletes its window rather than leaving it to the garbage
-  collector, which can crash PySide6 partway through a later test.
   Environment check: `.venv/bin/python packaging/preflight.py`.
 - Dependency versions are pinned in `requirements-mac.txt`; bump there and
   re-run tests + preflight + the frozen self-test before shipping.
@@ -75,6 +75,13 @@ to stay compatible with Windows, but the user may ask to port fixes across.
      timestamps come from `ForcedAligner` (Qwen3-ForcedAligner-0.6B), loaded
      once in `_QwenModel` and passed per call. Vocab hints -> `context=`;
      language codes map to full names via `QWEN_LANGUAGE_NAMES`.
+     Its languages are a closed list: `QWEN_LANGUAGE_NAMES` holds only names
+     in the model's own `support_languages` (no Norwegian or Ukrainian).
+     mlx-qwen3-asr does not enforce that list (it warns on stderr and forces
+     the name into the prompt), so `language_supported` is checked twice:
+     the window greys out what the chosen model lacks and refuses a
+     selection it already had, never turning it into auto-detect, and
+     `TranscribeWorker.run` refuses it before any model loads.
   `resolve_backend(model, device)` decides which of the four actually runs
   and returns a `Backend(engine, device)`; `_get_model` branches on that
   same value, so the path taken and the path reported cannot disagree.
@@ -96,7 +103,21 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   Every pass is budgeted against the model's real context window
   (`context_window()` reads `model.args.max_position_embeddings` — 40,960
   for Qwen3 — and never trusts `tokenizer.model_max_length` alone), minus
-  the prompt and `MAX_NOTES_TOKENS` of output. `split_text()` splits at line
+  the whole request and `MAX_NOTES_TOKENS` of output. What a pass carries
+  besides its content (system text, user instructions, chat template,
+  Qwen3's thinking switch, Gemma's folded system turn) is measured once a
+  run by building that pass with empty content through `_request()`, the
+  same builder generation uses. `stream_generate` is handed `_request()`'s
+  ids, so what was counted is what runs; the direct prompt is counted whole
+  before it is sent. (The PC's `/tokenize` and character fallbacks have no
+  counterpart here: the tokenizer is in-process and is generation's own.)
+  Instructions that leave less than `MIN_PROMPT_TOKENS` of room fail the
+  run in `_budgets()` with a "shorten them" message, before the notes
+  header is written. The minimum is a check, never a floor: the old
+  1,000-token floor sent prompts bigger than the window. mlx-lm neither
+  truncates nor refuses an oversized prompt — it prefills all of it and
+  the model runs past its trained window, so the notes degrade with no
+  error — which makes this sizing the only guard. `split_text()` splits at line
   boundaries *and* at token boundaries within an over-long line, because
   `coalesce()` turns a monologue into one enormous line. The combine step is
   hierarchical: `batch_by_tokens()` groups part summaries into passes that
@@ -112,7 +133,9 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   CPU/RAM via psutil. Polls off the main thread because ioreg takes ~50 ms.
 - `audio.py` — `tracks_for_file()` expands multitrack files (multiple audio
   streams -> track per stream; >2 channels -> track per channel; stereo split
-  is a right-click action). `decode_track_audio()` -> mono float32 16 kHz.
+  is a right-click action). `decode_track_audio()` -> mono float32 16 kHz,
+  on the file's own clock (see the invariants), reporting what it ran into
+  in a `Timing`.
 - `merger.py` / `exporters.py` — chronological merge, same-speaker
   coalescing, and md/txt/srt/vtt/json exporters. `merge_tracks()` skips
   `ERROR` tracks: an engine can emit segments and *then* raise, and those
@@ -146,6 +169,27 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   can make Qwen repeat text and corrupt forced-aligned timestamps.
 - All tracks are assumed to start at the same instant (multitrack recorder
   convention); merging is a sort by segment start time.
+- **Decode on the file's own clock.** Every engine, faster-whisper included,
+  is handed `decode_track_audio`'s array, never a path: faster-whisper's own
+  decoder lays audio end to end, so a stream that began late in its file
+  lands at 0:00 and everything after a gap in the timestamps moves earlier,
+  which breaks the same-instant rule above. `audio.py` measures every stream
+  in a file from one 0:00 (`container.start_time`, or the earliest packet
+  timestamp when the file declares none) and places each run of frames by
+  its timestamp: within `TIMING_TOLERANCE` (20 ms) it follows on; later is a
+  gap filled with silence (the resampler is restarted so it never blends
+  across one); earlier plays on from where the audio had got to and is
+  noted as a jump back, so no audio is dropped. A packet that won't decode
+  is skipped and counted. Silence is made up only to `MAX_TIMELINE_SECONDS`
+  (24 h). Ordinary files decode sample for sample as before (checked on
+  flac, m4a, mp3, ogg, opus, wav, mka, webm).
+  What decoding ran into reaches the track as `Track.note` via the worker's
+  `track_note` signal: "Done ⚠" with the note in the Status tooltip,
+  `decode_note` in the JSON export, `note:` lines in the self-test. The note
+  is stashed and restored with the transcript it came with. An
+  `AudioFileError` is the file's own problem, so the worker fails that track
+  without the fallback retry, which would read it no better and leave every
+  later track off the GPU.
 - **Never report the requested device as the one that ran.** Qwen ignores
   Device, onnx on a Mac ignores it, and Whisper ignores it without
   mlx-whisper. Everything user-facing (status bar, JSON export, self-test)

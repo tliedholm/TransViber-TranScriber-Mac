@@ -11,6 +11,7 @@ import cuda_setup  # noqa: F401  (must run before ctranslate2 loads)
 from PySide6.QtCore import QThread, Signal
 
 import diagnostics
+from audio import AudioFileError, Timing, decode_track_audio
 from models import RunConfig, Segment, Track
 
 # A pause this long between words splits a Whisper segment in two. Whisper can
@@ -30,21 +31,28 @@ ONNX_ALIASES = {
 }
 
 
-# Qwen3-ASR runs through mlx-qwen3-asr on the Apple GPU (macOS only).
-# UI names map to Hugging Face repos.
+# Qwen3-ASR (30 languages plus 22 Chinese dialects) runs through
+# mlx-qwen3-asr on the Apple GPU (macOS only). UI names map to Hugging Face
+# repos.
 QWEN_REPOS = {
     "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B",
     "qwen3-asr-0.6b": "Qwen/Qwen3-ASR-0.6B",
     "qwen3-asr": "Qwen/Qwen3-ASR-1.7B",
 }
 
-# Qwen3-ASR expects full language names, not Whisper's ISO codes.
+# Qwen3-ASR expects full language names, not Whisper's ISO codes. This is
+# also the list of Language choices Qwen can take, so it holds only names in
+# the model's own `support_languages` (its config.json), which has no
+# Norwegian or Ukrainian. mlx-qwen3-asr 0.3.5 does not refuse a name outside
+# that list: it only warns on stderr, which the app never shows, and forces
+# the name into the prompt anyway, so the model is asked for a language it
+# was never trained on. See language_supported.
 QWEN_LANGUAGE_NAMES = {
     "en": "English", "sv": "Swedish", "es": "Spanish", "fr": "French",
     "de": "German", "it": "Italian", "pt": "Portuguese", "nl": "Dutch",
-    "da": "Danish", "no": "Norwegian", "fi": "Finnish", "pl": "Polish",
-    "ru": "Russian", "uk": "Ukrainian", "ja": "Japanese", "ko": "Korean",
-    "zh": "Chinese", "ar": "Arabic", "hi": "Hindi", "tr": "Turkish",
+    "da": "Danish", "fi": "Finnish", "pl": "Polish", "ru": "Russian",
+    "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "ar": "Arabic",
+    "hi": "Hindi", "tr": "Turkish",
 }
 
 
@@ -60,6 +68,15 @@ def engine_for(model_name: str) -> str:
     if n in QWEN_REPOS or n.startswith("qwen"):
         return "qwen"
     return "whisper"
+
+
+def language_supported(model_name: str, language: str | None) -> bool:
+    """Whether `model_name` can be told to transcribe `language`, a Language
+    dropdown code (None is auto-detect). Only Qwen has a closed list: Whisper
+    knows every language the dropdown offers, and the NVIDIA models ignore
+    the setting."""
+    return (language is None or engine_for(model_name) != "qwen"
+            or language in QWEN_LANGUAGE_NAMES)
 
 
 # Friendly UI names for Whisper-family CTranslate2 repos, checked before the
@@ -380,6 +397,7 @@ class TranscribeWorker(QThread):
     track_progress = Signal(int, int)  # (track index, percent)
     track_done = Signal(int, str, object)  # (track index, language, RunConfig)
     track_failed = Signal(int, str)  # (track index, error message)
+    track_note = Signal(int, str)  # (track index, what its timestamps ran into)
     finished_all = Signal(bool)  # cancelled?
 
     def __init__(self, tracks: list[Track], indices: list[int], model_name: str,
@@ -427,6 +445,22 @@ class TranscribeWorker(QThread):
         self.backend = backend
         return model
 
+    def _decode(self, i: int):
+        """Track i's audio, 16 kHz mono on its file's own clock.
+
+        Every engine decodes here, faster-whisper included: its own decoder
+        ignores timestamps (see audio.py), so a gap or a late start in the
+        file would move every word after it.
+        """
+        track = self.tracks[i]
+        timing = Timing()
+        audio = decode_track_audio(track.path, track.stream_index, track.channel, timing)
+        note = timing.summary()
+        if note:
+            diagnostics.log_event("decode note", track=str(track.path), note=note)
+            self.track_note.emit(i, note)
+        return audio
+
     def _transcribe_track(self, model, i: int) -> bool:
         """Transcribe one track. Returns True if cancelled mid-track."""
         engine = self.backend.engine if self.backend else engine_for(self.model_name)
@@ -438,12 +472,9 @@ class TranscribeWorker(QThread):
             return self._transcribe_track_mlx(model, i)
         track = self.tracks[i]
         self.track_started.emit(i)
-        if track.is_subtrack:
-            from audio import decode_track_audio
-
-            source = decode_track_audio(track.path, track.stream_index, track.channel)
-        else:
-            source = str(track.path)
+        source = self._decode(i)
+        if self._stop:
+            return True
         segments, info = model.transcribe(
             source,
             language=self.language,
@@ -474,15 +505,15 @@ class TranscribeWorker(QThread):
         """
         import mlx_whisper
 
-        from audio import decode_track_audio
-
         track = self.tracks[i]
         self.track_started.emit(i)
         # Always decode through PyAV instead of handing mlx-whisper a path:
         # its own loader shells out to the ffmpeg CLI, which a stock Mac does
         # not have. A plain (non-multitrack) file would fail that way and get
         # retried on the CPU engine, silently losing the GPU speedup.
-        source = decode_track_audio(track.path, track.stream_index, track.channel)
+        source = self._decode(i)
+        if self._stop:
+            return True
         result = mlx_whisper.transcribe(
             source,
             path_or_hf_repo=model.repo,
@@ -532,16 +563,20 @@ class TranscribeWorker(QThread):
         capped at 240 s, under the aligner's 5-minute window. Vocabulary
         hints go in as decoder context.
         """
-        from audio import decode_track_audio
         from faster_whisper.vad import VadOptions, get_speech_timestamps
 
         track = self.tracks[i]
         self.track_started.emit(i)
-        audio = decode_track_audio(track.path, track.stream_index, track.channel)
+        audio = self._decode(i)
+        if self._stop:
+            return True
         regions = get_speech_timestamps(
             audio,
             vad_options=VadOptions(max_speech_duration_s=240, speech_pad_ms=400),
         )
+        # run() has already refused a language Qwen can't take, so a missing
+        # entry here is a bug, not a cue to auto-detect.
+        forced = QWEN_LANGUAGE_NAMES[self.language] if self.language else None
         language = ""
         for region in regions:
             if self._stop:
@@ -550,7 +585,7 @@ class TranscribeWorker(QThread):
             result = model.session.transcribe(
                 (audio[region["start"]:region["end"]], 16000),
                 context=self.hotwords,
-                language=QWEN_LANGUAGE_NAMES.get(self.language) if self.language else None,
+                language=forced,
                 return_timestamps=True,
                 forced_aligner=model.aligner,
             )
@@ -585,11 +620,11 @@ class TranscribeWorker(QThread):
 
     def _transcribe_track_onnx(self, model, i: int) -> bool:
         """Transcribe one track with an onnx-asr model (Parakeet etc.)."""
-        from audio import decode_track_audio
-
         track = self.tracks[i]
         self.track_started.emit(i)
-        audio = decode_track_audio(track.path, track.stream_index, track.channel)
+        audio = self._decode(i)
+        if self._stop:
+            return True
         duration = len(audio) / 16000
         for res in model.recognize(audio, sample_rate=16000):
             if self._stop:
@@ -610,6 +645,16 @@ class TranscribeWorker(QThread):
         self.download_progress.emit(-1, 0.0)
 
     def run(self) -> None:
+        # Before any model loads or downloads: no backend can transcribe a
+        # language the model doesn't have, and mlx-qwen3-asr would not say so.
+        if not language_supported(self.model_name, self.language):
+            for i in self.indices:
+                self.track_failed.emit(
+                    i, f"{self.model_name} can't transcribe language "
+                       f"'{self.language}'. Choose another language or "
+                       f"Auto-detect, or a Whisper model.")
+            self.finished_all.emit(False)
+            return
         # Model weights can download at load time or — on the mlx-whisper
         # path — lazily during the first transcribe call, so the download
         # callback stays active for the whole run. Resets between phases stop
@@ -643,6 +688,14 @@ class TranscribeWorker(QThread):
                     break
                 try:
                     cancelled = self._transcribe_track(model, i)
+                except AudioFileError as exc:
+                    # The file itself: another backend would read it no
+                    # better, and moving to it would leave every later
+                    # track off the GPU too.
+                    diagnostics.log_exception(
+                        "decode", exc, track=str(self.tracks[i].path),
+                        model=self.model_name, backend=self.backend.label)
+                    self.track_failed.emit(i, str(exc))
                 except Exception as exc:
                     diagnostics.log_exception(
                         "transcribe", exc, track=str(self.tracks[i].path),

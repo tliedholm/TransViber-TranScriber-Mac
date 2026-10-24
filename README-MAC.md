@@ -34,8 +34,10 @@ Transcribe, Export. Vocabulary hints work with Whisper models for D&D names.
 The **Notes** tab mirrors the merged transcript and keeps manually entered
 notes autosaved on this Mac. **AI Notes** uses a downloadable local MLX model
 to write Markdown summaries; its optional instructions are added to the
-built-in summary prompt. ASR and notes models are unloaded before the other
-kind starts so they do not compete for unified memory.
+built-in summary prompt. Instructions so long that they leave the model too
+little room for the transcript are refused with a message saying to shorten
+them, before anything is written. ASR and notes models are unloaded before
+the other kind starts so they do not compete for unified memory.
 
 AI Notes are laid out as: summary, key points and decisions, memorable
 moments, open questions, then **Per-person summary** (each speaker and any
@@ -56,8 +58,11 @@ earlier session is carried in.
     `large-v3-turbo` is roughly 5–10× faster than real time.
   - `qwen3-asr-1.7b` / `-0.6b` run through **mlx-qwen3-asr** on the Metal
     GPU (always, whatever Device says) — state-of-the-art accuracy,
-    52 languages, and vocabulary hints work. First use downloads the model
-    plus a small aligner model for word timestamps.
+    30 languages, and vocabulary hints work. Qwen3-ASR has no Norwegian or
+    Ukrainian, so those are greyed out while a Qwen model is selected, and
+    Transcribe asks for another choice if one of them was already picked.
+    First use downloads the model plus a small aligner model for word
+    timestamps.
   - `parakeet-tdt-0.6b-v2/v3` run through **onnx-asr on the CPU** whatever
     Device says — still very fast (about 15–20× real time), great English
     accuracy, no vocabulary-hint support. CoreML is deliberately not used:

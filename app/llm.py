@@ -99,13 +99,27 @@ MAX_NOTES_TOKENS = 6_000  # generation cap per pass, also drives the percent
 
 # Context window assumed when the model does not report one. Deliberately
 # below the smallest window in NOTES_MODEL_GROUPS rather than an optimistic
-# guess: overshooting silently truncates the transcript inside the runtime.
+# guess: overshooting is silent. mlx-lm neither truncates nor refuses a prompt
+# past the model's window (stream_generate prefills all of it into an
+# unbounded KV cache); the model just reads and writes past what it was
+# trained on, and the notes degrade with no error.
 DEFAULT_CONTEXT_TOKENS = 32_768
 CONTEXT_LIMITS = (2_048, 262_144)  # sanity clamp on whatever a model claims
 
-# Slack for the chat template, the transcript's own headers, and tokenizer
-# disagreement between counting and generating.
+# Slack for tokenizer disagreement between counting content on its own and
+# counting it inside the whole prompt (merges across the seam, a BOS counted
+# with each piece). The chat template itself is measured, not guessed: see
+# input_budget().
 PROMPT_MARGIN_TOKENS = 512
+
+# The least room for transcript a pass may be left once the instructions are
+# in. Instructions ride along with every pass and are user-editable; past this
+# point they are the problem, and cutting the transcript smaller would just
+# produce hundreds of parts. A check, not a floor: a run that can't meet it is
+# refused before anything is generated. The old floor granted 1,000 tokens
+# regardless, so instructions bigger than the window still sent a prompt
+# bigger than the window.
+MIN_PROMPT_TOKENS = 2_000
 
 # One LLM kept loaded between runs (reruns with tweaked instructions are
 # common); freed when a transcription starts — see free_llm().
@@ -154,6 +168,28 @@ def _build_prompt(tokenizer, model_name: str, system_text: str, user_text: str) 
         messages, tokenize=False, add_generation_prompt=True, **kwargs)
 
 
+def _request(tokenizer, model_name: str, system_text: str, user_text: str) -> list[int]:
+    """The tokens of one pass, built alike for generating and for counting.
+
+    Counting goes through the same builder as generation because the chat
+    template changes what a prompt costs (role headers, Gemma folding the
+    system text into the user turn, Qwen3's thinking switch), so a count of
+    the text alone is a count of some other prompt. stream_generate is handed
+    these ids, so what was counted is exactly what runs.
+    """
+    prompt = _build_prompt(tokenizer, model_name, system_text, user_text)
+    # stream_generate's own rule for a string prompt (mlx-lm 0.31.3): add the
+    # special tokens unless the template already starts with BOS.
+    bos = getattr(tokenizer, "bos_token", None)
+    return list(tokenizer.encode(
+        prompt, add_special_tokens=bos is None or not prompt.startswith(bos)))
+
+
+def prompt_limit(context: int) -> int:
+    """The most one whole prompt may hold: the window less the notes' room."""
+    return context - MAX_NOTES_TOKENS
+
+
 def context_window(model, tokenizer) -> int:
     """The model's context length, clamped to something believable."""
     for source, attribute in ((getattr(model, "args", None), "max_position_embeddings"),
@@ -165,15 +201,19 @@ def context_window(model, tokenizer) -> int:
     return DEFAULT_CONTEXT_TOKENS
 
 
-def input_budget(tokenizer, context: int, system_text: str) -> int:
-    """How many tokens of transcript one pass can take.
+def input_budget(tokenizer, model_name: str, context: int, system_text: str) -> int:
+    """How many tokens of content one pass with this system text can take.
 
-    The old constants budgeted the input alone. A pass also has to fit its
-    system prompt and everything it generates — up to MAX_NOTES_TOKENS — in
-    the same window, so both are subtracted here.
+    Everything the pass carries besides its content (system text,
+    instructions, chat template, generation prompt) is measured by building
+    the whole request with the content left empty, through the same _request
+    as generation. The window also has to hold everything the pass generates,
+    up to MAX_NOTES_TOKENS. The result can be under MIN_PROMPT_TOKENS, or
+    negative; NotesWorker._budgets() refuses the run then, rather than
+    granting room the window doesn't have.
     """
-    overhead = len(tokenizer.encode(system_text)) + MAX_NOTES_TOKENS + PROMPT_MARGIN_TOKENS
-    return max(1_000, context - overhead)
+    overhead = len(_request(tokenizer, model_name, system_text, ""))
+    return prompt_limit(context) - PROMPT_MARGIN_TOKENS - overhead
 
 
 def _line_pieces(line: str, tokenizer, limit: int) -> list[str]:
@@ -260,8 +300,31 @@ class NotesWorker(QThread):
             text += "\n\nAdditional instructions: " + self.instructions
         return text
 
-    def _generate(self, model, tokenizer, prompt: str, stream: bool) -> str:
-        """One generation pass; streams chunks to the editor if `stream`."""
+    def _budgets(self, tokenizer, context: int) -> tuple[int, int, int, int]:
+        """Room for content in a direct, part, combine and merge pass.
+
+        Measured once a run, since only the content changes from pass to pass
+        (input_budget). Raises, before anything is generated, when any of them
+        is under MIN_PROMPT_TOKENS: the instructions are then the problem, and
+        no way of cutting up the transcript gets round them.
+        """
+        budgets = tuple(
+            input_budget(tokenizer, self.model_name, context, system_text)
+            for system_text in (self._system_text(), self._system_text(PART_PROMPT),
+                                self._system_text(COMBINE_PROMPT), MERGE_PROMPT))
+        room = min(budgets)
+        if room < MIN_PROMPT_TOKENS:
+            raise ValueError(
+                f"The AI instructions are too long for this notes model. With "
+                f"them in, a prompt has room for {max(0, room):,} tokens of "
+                f"transcript out of the {prompt_limit(context):,} the model can "
+                f"read at once, and it needs at least {MIN_PROMPT_TOKENS:,}. "
+                f"Shorten the AI instructions, or choose a notes model with a "
+                f"larger context.")
+        return budgets
+
+    def _generate(self, model, tokenizer, prompt: list[int], stream: bool) -> str:
+        """One generation pass over _request() ids; streams to the editor if `stream`."""
         from mlx_lm import stream_generate
 
         pieces = []
@@ -284,7 +347,8 @@ class NotesWorker(QThread):
 
     JOINER = "\n\n---\n\n"
 
-    def _combine(self, model, tokenizer, notes: list[str], context: int) -> None:
+    def _combine(self, model, tokenizer, notes: list[str],
+                 final_budget: int, merge_budget: int) -> None:
         """Reduce part summaries to one final set of notes, in bounded passes.
 
         Batches that do not all fit in one window are merged a level at a
@@ -292,8 +356,6 @@ class NotesWorker(QThread):
         uses COMBINE_PROMPT and streams to the editor, so the tail sections
         are written once, from the whole session.
         """
-        final_budget = input_budget(tokenizer, context, self._system_text(COMBINE_PROMPT))
-        merge_budget = input_budget(tokenizer, context, MERGE_PROMPT)
         # Batching cannot help if one summary is bigger than a whole pass, so
         # split those first: every batch then provably fits. Generation is
         # capped at MAX_NOTES_TOKENS and the budgets already subtract it, so
@@ -309,9 +371,9 @@ class NotesWorker(QThread):
             if len(batches) == 1:
                 self.status.emit("Combining notes…")
                 self._generate(model, tokenizer,
-                               _build_prompt(tokenizer, self.model_name,
-                                             self._system_text(COMBINE_PROMPT),
-                                             self.JOINER.join(batches[0])),
+                               _request(tokenizer, self.model_name,
+                                        self._system_text(COMBINE_PROMPT),
+                                        self.JOINER.join(batches[0])),
                                stream=True)
                 return
             level += 1
@@ -326,8 +388,8 @@ class NotesWorker(QThread):
                     f"Merging notes (round {level}, {n}/{len(batches)})…")
                 merged.append(self._generate(
                     model, tokenizer,
-                    _build_prompt(tokenizer, self.model_name, MERGE_PROMPT,
-                                  self.JOINER.join(batch)),
+                    _request(tokenizer, self.model_name, MERGE_PROMPT,
+                             self.JOINER.join(batch)),
                     stream=False))
             if len(merged) >= len(notes):
                 # No progress (one oversized note per batch): stop reducing and
@@ -335,9 +397,9 @@ class NotesWorker(QThread):
                 notes = merged
                 self.status.emit("Combining notes…")
                 self._generate(model, tokenizer,
-                               _build_prompt(tokenizer, self.model_name,
-                                             self._system_text(COMBINE_PROMPT),
-                                             self.JOINER.join(notes)),
+                               _request(tokenizer, self.model_name,
+                                        self._system_text(COMBINE_PROMPT),
+                                        self.JOINER.join(notes)),
                                stream=True)
                 return
             notes = merged
@@ -353,17 +415,22 @@ class NotesWorker(QThread):
             free_asr_models()
             model, tokenizer = _get_llm(self.model_name, self.status.emit)
 
+            context = context_window(model, tokenizer)
+            # Before the header, so instructions that can't fit fail the run
+            # with nothing written to the notes.
+            _, part_budget, final_budget, merge_budget = self._budgets(tokenizer, context)
+
             header = "## AI Notes — " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             self.chunk.emit(header + "\n\n")
 
-            context = context_window(model, tokenizer)
-            if len(tokenizer.encode(self.transcript)) <= input_budget(
-                    tokenizer, context, self._system_text()):
+            # The direct prompt is counted whole, so it goes out only if the
+            # very ids it would run fit; the budgets size the parts.
+            direct = _request(tokenizer, self.model_name, self._system_text(),
+                              self.transcript)
+            if len(direct) <= prompt_limit(context):
                 parts = [self.transcript]  # one pass, full prompt, tail sections and all
             else:
-                parts = split_text(
-                    self.transcript, tokenizer,
-                    input_budget(tokenizer, context, self._system_text(PART_PROMPT)))
+                parts = split_text(self.transcript, tokenizer, part_budget)
             self._tokens = 0
             self._pass_base = 0
             self._passes_done = 0
@@ -372,10 +439,7 @@ class NotesWorker(QThread):
 
             if len(parts) == 1:
                 self.status.emit("Writing notes…")
-                self._generate(model, tokenizer,
-                               _build_prompt(tokenizer, self.model_name,
-                                             self._system_text(), parts[0]),
-                               stream=True)
+                self._generate(model, tokenizer, direct, stream=True)
             else:
                 part_text = self._system_text(PART_PROMPT)
                 part_notes = []
@@ -385,10 +449,10 @@ class NotesWorker(QThread):
                     self.status.emit(f"Writing notes for part {n}/{len(parts)}…")
                     part_notes.append(self._generate(
                         model, tokenizer,
-                        _build_prompt(tokenizer, self.model_name, part_text, part),
+                        _request(tokenizer, self.model_name, part_text, part),
                         stream=False))
                 if not self._stop:
-                    self._combine(model, tokenizer, part_notes, context)
+                    self._combine(model, tokenizer, part_notes, final_budget, merge_budget)
 
             if self._stop:
                 self.chunk.emit("\n\n*(cancelled)*")
