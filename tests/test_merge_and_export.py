@@ -1,6 +1,8 @@
 """Merging, coalescing and the five exporters."""
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -122,3 +124,147 @@ def test_export_all_writes_every_format(tmp_path):
 def test_export_rejects_an_unknown_extension(tmp_path):
     with pytest.raises(ValueError):
         exporters.export(tmp_path / "out.doc", [], [])
+
+
+# ---------- Each file replaced whole, and a failure says how far it got ----------
+
+SEGMENTS = [Segment("Alice", 0.0, 1.0, "hello")]
+TRACKS = [track("Alice", [(0.0, 1.0, "hello")])]
+
+
+def failing_on(call, real, error=None):
+    """A stand-in for `real` that raises `error` on its `call`th use (from 1)
+    and otherwise does what the real function does."""
+    error = error or PermissionError(13, "Permission denied")
+    count = {"n": 0}
+
+    def stand_in(*args, **kwargs):
+        count["n"] += 1
+        if count["n"] == call:
+            raise error
+        return real(*args, **kwargs)
+    return stand_in
+
+
+@pytest.fixture
+def old_exports(tmp_path):
+    """A folder holding an earlier export of every format."""
+    base = tmp_path / "session.md"
+    targets = [base.with_suffix(ext) for ext in exporters.EXPORTERS]
+    for path in targets:
+        path.write_text("old " + path.suffix, encoding="utf-8")
+    return base, targets
+
+
+def contents(paths):
+    return {p.name: p.read_text(encoding="utf-8") for p in paths}
+
+
+def untouched(targets):
+    return contents(targets) == {p.name: "old " + p.suffix for p in targets}
+
+
+def no_staged_files_left(targets):
+    return sorted(targets[0].parent.iterdir()) == sorted(targets)
+
+
+def test_a_full_disk_while_staging_changes_nothing(old_exports, monkeypatch):
+    base, targets = old_exports
+    full = OSError(28, "No space left on device")
+    monkeypatch.setattr(exporters.os, "fsync", failing_on(3, os.fsync, full))
+    with pytest.raises(exporters.ExportError) as caught:
+        exporters.export_all(base, SEGMENTS, TRACKS)
+    assert untouched(targets)
+    assert no_staged_files_left(targets)
+    error = caught.value
+    assert error.written == []
+    assert error.failed == targets[2]
+    assert set(error.unchanged) == set(targets)
+    assert "No space left on device" in str(error)
+    assert "Nothing was exported" in str(error)
+
+
+def test_a_failed_first_replacement_reports_nothing_written(old_exports, monkeypatch):
+    base, targets = old_exports
+    monkeypatch.setattr(exporters.os, "replace", failing_on(1, os.replace))
+    with pytest.raises(exporters.ExportError) as caught:
+        exporters.export_all(base, SEGMENTS, TRACKS)
+    assert untouched(targets)
+    assert no_staged_files_left(targets)
+    assert caught.value.written == []
+    assert caught.value.unchanged == targets
+
+
+def test_a_failed_second_replacement_names_what_is_new_and_what_is_old(
+        old_exports, monkeypatch):
+    base, targets = old_exports
+    monkeypatch.setattr(exporters.os, "replace", failing_on(2, os.replace))
+    with pytest.raises(exporters.ExportError) as caught:
+        exporters.export_all(base, SEGMENTS, TRACKS)
+    error = caught.value
+    md, txt = targets[:2]
+    assert error.written == [md]
+    assert error.failed == txt
+    assert error.unchanged == targets[1:]
+    assert isinstance(error, OSError)  # the window's `except OSError` still catches it
+    assert isinstance(error.__cause__, PermissionError)
+    # The one that was replaced is whole; the rest are exactly as they were.
+    now = contents(targets)
+    assert now.pop(md.name) == exporters.to_markdown(SEGMENTS)
+    assert now == {p.name: "old " + p.suffix for p in targets[1:]}
+    assert no_staged_files_left(targets)
+    message = str(error)
+    assert ("Exported session.md, but could not write session.txt: Permission denied"
+            in message)
+    assert "Not updated: session.txt, session.srt, session.vtt, session.json" in message
+
+
+def test_a_cleanup_failure_never_hides_the_real_error(old_exports, monkeypatch):
+    base, targets = old_exports
+    monkeypatch.setattr(exporters.os, "replace", failing_on(1, os.replace))
+
+    def unlink(self, *args, **kwargs):
+        raise OSError("busy")
+    monkeypatch.setattr(exporters.Path, "unlink", unlink)
+    with pytest.raises(exporters.ExportError) as caught:
+        exporters.export_all(base, SEGMENTS, TRACKS)
+    assert "Permission denied" in str(caught.value)
+    assert "busy" not in str(caught.value)
+    assert untouched(targets)
+
+
+def test_a_failed_single_format_export_keeps_the_old_file(old_exports, monkeypatch):
+    base, targets = old_exports
+    srt = base.with_suffix(".srt")
+    monkeypatch.setattr(exporters.os, "replace", failing_on(1, os.replace))
+    with pytest.raises(exporters.ExportError) as caught:
+        exporters.export(srt, SEGMENTS, TRACKS)
+    assert srt.read_text(encoding="utf-8") == "old .srt"
+    assert no_staged_files_left(targets)
+    assert (str(caught.value).splitlines()[0]
+            == "Could not write session.srt: Permission denied")
+
+
+def test_a_successful_export_replaces_every_file_whole(old_exports):
+    base, targets = old_exports
+    assert exporters.export_all(base, SEGMENTS, TRACKS) == targets
+    assert contents(targets)["session.vtt"] == exporters.to_vtt(SEGMENTS)
+    assert no_staged_files_left(targets)
+
+
+def test_a_replaced_file_keeps_its_permissions(tmp_path):
+    # Staged through a temp file, but not with mkstemp's owner-only 0o600.
+    target = tmp_path / "notes.md"
+    target.write_text("old", encoding="utf-8")
+    target.chmod(0o640)
+    exporters.write_file(target, "new")
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_a_new_file_gets_the_permissions_a_plain_write_would(tmp_path):
+    plain = tmp_path / "plain.txt"
+    plain.write_text("x", encoding="utf-8")
+    staged = tmp_path / "staged.txt"
+    exporters.write_file(staged, "x")
+    assert stat.S_IMODE(staged.stat().st_mode) == stat.S_IMODE(plain.stat().st_mode)

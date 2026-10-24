@@ -13,10 +13,12 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   Launch: `./TransViber TransScriber.command` or
   `.venv/bin/python app/main.py`.
 - Tests: `.venv/bin/python -m pytest tests` (fast; no models or downloads).
-  `tests/test_track_status.py` builds a real `MainWindow` offscreen, with
-  settings in a scratch file and no stats thread; a new window test should
-  delete its window explicitly, since PySide6 6.11 can crash collecting a
-  closed one.
+  `tests/test_track_status.py` and `tests/test_window_lifecycle.py` build a
+  real `MainWindow` offscreen, with settings in a scratch file; a new window
+  test should delete its window explicitly, since PySide6 6.11 can crash
+  collecting a closed one. `test_window_lifecycle` covers the export
+  warning and failure reports, and closing with unsaved notes — including
+  a real notes thread whose last chunks are still queued when it stops.
   Environment check: `.venv/bin/python packaging/preflight.py`.
 - Dependency versions are pinned in `requirements-mac.txt`; bump there and
   re-run tests + preflight + the frozen self-test before shipping.
@@ -47,7 +49,11 @@ to stay compatible with Windows, but the user may ask to port fixes across.
 - `main.py` — entry point. Also handles files opened from Finder: argv at
   launch (argv_emulation) and `QFileOpenEvent` for an already-running app.
 - `main_window.py` — all UI. Transcribe tab, live merged transcript, and
-  Notes tab with autosaved manual/local-AI notes.
+  Notes tab with autosaved manual/local-AI notes. The notes live in
+  QSettings (`"notes"`); `_save_notes` syncs and checks `status()` so a
+  failed write is reported, never assumed. `_notes_dirty` is set by every
+  change, typed or streamed, and cleared only by a save that succeeded, so
+  untouched notes are never rewritten and a failed save is never forgotten.
   `IS_MAC` switches the Device combo to "GPU (Metal)" (`"mlx"`) / CPU.
   Settings (model, language, vocab hints) persist via QSettings.
 - `diagnostics.py` — rotating log at
@@ -136,6 +142,16 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   partial segments would make an incomplete track read as finished. They
   stay on the Track (the UI reports the count) but never reach the
   transcript or an export. Speaker names are escaped per format.
+  Export first warns about every track that isn't Done
+  (`_missing_from_export`): failed (left out whole), cancelled (partial or
+  empty) and never transcribed alike; a Done track with no segments is
+  silent audio and doesn't count. Every export, Export Notes included,
+  stages each file beside its target (unique name, fsynced, the replaced
+  file's permissions or the umask's — not mkstemp's 0o600) before renaming
+  any into place, so a failure never half-writes a file. A rename that
+  fails raises `ExportError` (an `OSError`) naming the files already new
+  and the ones still old. Five renames are not one transaction; don't let
+  a docstring claim they are.
 
 ## Critical invariants — do not break
 
@@ -186,7 +202,17 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   transcribes a whole track in one blocking call, a Qwen region runs up to
   240 s, and downloads are unbounded — none can be interrupted. `closeEvent`
   defers the close and `_quit_if_idle()` completes it; "Quit now" uses
-  `os._exit(0)` rather than tearing down a live `QThread`.
+  `os._exit(0)` rather than tearing down a live `QThread`. A job counts as
+  over once its finish handler has run (it drops the window's reference),
+  not when `isRunning()` turns false: the last notes chunks are still
+  queued behind a finished thread. `QThread.finished` is the backstop for a
+  run that dies without its finish signal (`_on_thread_finished`).
+- **A close never loses notes it could not write.** Only once every job is
+  over are the notes saved for the last time; if that save fails (or the
+  notes can't be saved before "Quit now"), one prompt offers Retry / Save
+  Elsewhere / Return to App / Close Without Saving. Return to App calls the
+  quit off with the stats poller and autosave still running, and the
+  finish handlers reset their controls even while quitting.
 - **No ffmpeg CLI**: all decoding goes through PyAV (`decode_track_audio`).
   Never hand mlx-whisper a file path — its loader shells out to an `ffmpeg`
   binary that is not installed here and is absent from the shipped `.app`;
