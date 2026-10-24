@@ -106,6 +106,27 @@ def _fmt_duration(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def _missing_from_export(track: Track) -> str | None:
+    """How much of a track's speech an export would leave out, or None.
+
+    A finished track with no segments is silent audio, not a gap, so only
+    the status decides. A failed track is left out whole, partial segments
+    and all (see merge_tracks); a cancelled one keeps what it finished; one
+    that never started is missing as surely as either.
+    """
+    if track.status is TrackStatus.DONE:
+        return None
+    if track.status is TrackStatus.PENDING:
+        return "not transcribed"
+    if track.status is TrackStatus.TRANSCRIBING:
+        return "still transcribing"
+    if track.status is TrackStatus.ERROR:
+        return ("failed partway — its partial transcript is left out" if track.segments
+                else "failed — nothing transcribed")
+    return ("cancelled partway — partial transcript" if track.segments
+            else "cancelled — nothing transcribed")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -120,6 +141,11 @@ class MainWindow(QMainWindow):
         # Set once the user asks to quit while a worker is still running; the
         # close is completed by _quit_if_idle() when the worker really stops.
         self._quit_requested = False
+        # Every change to the notes sets it; only a write that succeeded
+        # clears it. A close never drops notes it could not write unasked.
+        self._notes_dirty = False
+        self._notes_save_error = ""
+        self._asking_about_notes = False
 
         self._build_ui()
         self._load_settings()
@@ -490,7 +516,7 @@ class MainWindow(QMainWindow):
         self._notes_save_timer.setInterval(3000)
         self._notes_save_timer.setSingleShot(True)
         self._notes_save_timer.timeout.connect(self._save_notes)
-        self.notes_edit.textChanged.connect(self._notes_save_timer.start)
+        self.notes_edit.textChanged.connect(self._on_notes_changed)
 
         self.notes_worker: NotesWorker | None = None
         self._notes_started: float | None = None
@@ -500,8 +526,34 @@ class MainWindow(QMainWindow):
         self._notes_elapsed_timer.timeout.connect(self._tick_notes_elapsed)
         return page
 
-    def _save_notes(self) -> None:
-        QSettings().setValue("notes", self.notes_edit.toPlainText())
+    def _on_notes_changed(self) -> None:
+        """Typing and streamed AI notes alike: unsaved until a write succeeds."""
+        self._notes_dirty = True
+        self._notes_save_timer.start()
+
+    def _save_notes(self) -> bool:
+        """Store the Notes tab; True once the settings file holds what the
+        editor does. Nothing changed since the last save, nothing is written.
+
+        Synced and checked rather than left to QSettings' lazy write, which
+        never reports a failure. Failures appear in the status bar: a modal
+        error after every edit would be unusable. The text stays in the
+        editor, still unsaved, and is retried on the next edit and on close,
+        which will not go ahead without it (see _settle_unsaved_notes).
+        """
+        if not self._notes_dirty:
+            return True
+        settings = QSettings()
+        settings.setValue("notes", self.notes_edit.toPlainText())
+        settings.sync()
+        if settings.status() != QSettings.Status.NoError:
+            self._notes_save_error = (
+                f"The settings file could not be written: {settings.fileName()}")
+            self.statusBar().showMessage(
+                f"Notes could not be saved: {self._notes_save_error}")
+            return False
+        self._notes_dirty = False
+        return True
 
     def _tick_notes_elapsed(self) -> None:
         if self._notes_started is not None:
@@ -509,19 +561,25 @@ class MainWindow(QMainWindow):
                 self._format_elapsed(time.monotonic() - self._notes_started))
 
     def export_notes_dialog(self) -> None:
-        text = self.notes_edit.toPlainText()
-        if not text.strip():
+        if not self.notes_edit.toPlainText().strip():
             return
+        self._write_notes_copy("Export notes")
+
+    def _write_notes_copy(self, title: str) -> bool:
+        """Ask for a file and write the notes to it; True once written."""
         path_str, _ = QFileDialog.getSaveFileName(
-            self, "Export notes", str(Path.home() / "notes.md"),
+            self, title, str(Path.home() / "notes.md"),
             "Markdown (*.md);;Plain text (*.txt)")
         if not path_str:
-            return
+            return False
         try:
-            Path(path_str).write_text(text, encoding="utf-8")
-            self.statusBar().showMessage(f"Exported {path_str}", 5000)
+            exporters.write_file(Path(path_str), self.notes_edit.toPlainText())
         except OSError as exc:
+            diagnostics.log_exception("notes export", exc, path=path_str)
             QMessageBox.critical(self, "Export failed", str(exc))
+            return False
+        self.statusBar().showMessage(f"Exported {path_str}", 5000)
+        return True
 
     # ---------- AI notes ----------
 
@@ -557,6 +615,7 @@ class MainWindow(QMainWindow):
         w.progress.connect(self._on_notes_progress)
         w.completed.connect(self._on_notes_done)
         w.failed.connect(self._on_notes_failed)
+        w.finished.connect(self._on_thread_finished)
         # ASR model and notes LLM must never be loaded together: the worker
         # frees the ASR cache before loading, and Transcribe stays disabled
         # until notes finish (the reverse holds in toggle_transcription).
@@ -894,6 +953,7 @@ class MainWindow(QMainWindow):
         w.track_done.connect(self._on_track_done)
         w.track_failed.connect(self._on_track_failed)
         w.finished_all.connect(self._on_finished)
+        w.finished.connect(self._on_thread_finished)
         llm.free_llm()  # ASR and notes LLM never share memory
         diagnostics.log_event("transcription started", model=wanted.model,
                               device=wanted.device, language=wanted.language,
@@ -1092,9 +1152,37 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Cancel)
         return answer == QMessageBox.StandardButton.Yes
 
+    def _confirm_incomplete_export(self) -> bool:
+        """Warn before exporting when any track isn't fully transcribed.
+
+        A failed track is left out of the export entirely, and one that was
+        cancelled, or never ran, is missing all or part of its speaker. Only
+        JSON records track status; the other formats would leave that
+        speaker out without a trace.
+        """
+        incomplete = [(t, gap) for t in self.tracks
+                      if (gap := _missing_from_export(t)) is not None]
+        if not incomplete:
+            return True
+        listed = "\n".join(f"  • {t.source_label} — {gap}"
+                           for t, gap in incomplete[:5])
+        if len(incomplete) > 5:
+            listed += f"\n  • …and {len(incomplete) - 5} more"
+        answer = QMessageBox.warning(
+            self, "Incomplete transcript",
+            f"{len(incomplete)} track(s) not fully transcribed:\n\n{listed}\n\n"
+            "Whatever those speakers said that wasn't transcribed will be "
+            "missing from the export. Export anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def export_dialog(self) -> None:
         segments = merge_tracks(self.tracks)
         if not segments:
+            return
+        if not self._confirm_incomplete_export():
             return
         default_name = str(Path.home() / "transcript.md")
         path_str, selected = QFileDialog.getSaveFileName(
@@ -1120,6 +1208,14 @@ class MainWindow(QMainWindow):
                     return
                 exporters.export(path, segments, self.tracks)
                 self.statusBar().showMessage(f"Exported {path}", 5000)
+        except exporters.ExportError as exc:
+            written = ", ".join(p.name for p in exc.written)
+            diagnostics.log_exception("export", exc, path=str(path), written=written)
+            # Some formats can be new and the rest old: say so, not just "failed".
+            if exc.written:
+                self.statusBar().showMessage("Partly exported: " + written)
+            QMessageBox.critical(
+                self, "Export incomplete" if exc.written else "Export failed", str(exc))
         except OSError as exc:
             diagnostics.log_exception("export", exc, path=str(path))
             QMessageBox.critical(self, "Export failed", str(exc))
@@ -1138,7 +1234,13 @@ class MainWindow(QMainWindow):
         if lang_index >= 0:
             self.combo_lang.setCurrentIndex(lang_index)
         self._update_hints_visibility()
-        self.notes_edit.setPlainText(settings.value("notes", "", str))
+        # Loading is not a change: it must not mark the notes unsaved or
+        # schedule a rewrite of what was just read.
+        self.notes_edit.blockSignals(True)
+        try:
+            self.notes_edit.setPlainText(settings.value("notes", "", str))
+        finally:
+            self.notes_edit.blockSignals(False)
         notes_model = (settings.value("starred_notes_model", "", str)
                        or settings.value("notes_model", "", str))
         if notes_model:
@@ -1161,25 +1263,52 @@ class MainWindow(QMainWindow):
         settings.setValue("notes_model", self.combo_notes_model.currentText().strip())
         settings.setValue(
             "notes_instructions", self.edit_notes_instructions.toPlainText())
-        self._save_notes()
+        # The notes are saved on their own, so that a failure can stop the
+        # close — see _save_notes.
 
     # ---------- Shutdown ----------
 
-    def _live_workers(self) -> list:
-        return [w for w in (self.worker, self.notes_worker)
-                if w is not None and w.isRunning()]
+    def _unfinished_jobs(self) -> list:
+        """Jobs whose finish handler has not run yet.
+
+        Not the same as threads still running: a notes run's last chunks and
+        its `completed` signal are still queued behind a thread that has
+        already stopped, and closing then would lose them. Each finish
+        handler drops the window's reference to its job.
+        """
+        return [w for w in (self.worker, self.notes_worker) if w is not None]
 
     def _quit_if_idle(self) -> None:
-        """Finish a deferred quit once the last worker has really stopped.
+        """Finish a deferred quit once the last job's finish handler has run.
 
         Deferred to the next event-loop turn so the handler that called this
         can finish before the window goes away.
         """
-        if self._quit_requested and not self._live_workers():
+        if self._quit_requested and not self._unfinished_jobs():
             QTimer.singleShot(0, self.close)
 
+    @Slot()
+    def _on_thread_finished(self) -> None:
+        """Backstop for a run that ended without sending its finish signal.
+
+        QThread.finished is queued behind every signal the run emitted, so
+        by now the job's own handler has normally run and dropped it. A run
+        that died first would otherwise leave its controls stuck and a quit
+        waiting forever (see _unfinished_jobs).
+        """
+        job = self.sender()
+        if job is None:
+            return
+        if job is self.worker:
+            diagnostics.log_event("transcription thread ended without finishing")
+            self._on_finished(True)
+        elif job is self.notes_worker:
+            diagnostics.log_event("notes thread ended without finishing")
+            self._on_notes_failed(
+                f"AI notes stopped unexpectedly.\n\nDetails: {diagnostics.log_path()}")
+
     def closeEvent(self, event) -> None:
-        """Close only once no worker thread is still alive.
+        """Close only once every job is over and the notes are saved.
 
         Waiting a fixed few seconds and accepting the close regardless used to
         leave live QThreads attached to a destroyed window — a crash or hang.
@@ -1187,29 +1316,32 @@ class MainWindow(QMainWindow):
         whole track in one blocking call, a Qwen speech region runs up to
         240 s, and model downloads are unbounded. None of them can be
         interrupted, so the window waits instead, and the user is offered an
-        explicit way out.
+        explicit way out. A failed final notes save keeps the window open
+        behind one prompt rather than losing what is only in the editor.
         """
+        if self._asking_about_notes:
+            event.ignore()  # another Quit, or the deferred close, under the prompt
+            return
         self._save_settings()
-        workers = self._live_workers()
-        if not workers:
-            self.stats_poller.stop()
-            self.stats_poller.wait(3000)
-            event.accept()
+        jobs = self._unfinished_jobs()
+        if not jobs:
+            self._close_with_notes_saved(event)
             return
 
         if not self._quit_requested:
             self._quit_requested = True
-            for worker in workers:
-                worker.stop()
+            self._save_notes()  # a first copy now, should stopping take long
+            for job in jobs:
+                job.stop()
             self.statusBar().showMessage(
                 "Quitting — waiting for the current step to finish…")
 
         # A short wait covers the common case: between two tracks, or mid
-        # generation, the stop flag is noticed almost immediately.
-        if all(worker.wait(2000) for worker in workers) and not self._live_workers():
-            self.stats_poller.stop()
-            self.stats_poller.wait(3000)
-            event.accept()
+        # generation, the stop flag is noticed almost immediately. The close
+        # still waits for the finish handlers, which call _quit_if_idle():
+        # the last notes chunks are queued behind the stopped thread.
+        if all(job.wait(2000) for job in jobs):
+            event.ignore()
             return
 
         box = QMessageBox(self)
@@ -1226,9 +1358,71 @@ class MainWindow(QMainWindow):
         box.exec()
         if box.clickedButton() is not keep:
             # Nothing can unblock a native call already in flight, and tearing
-            # down running QThreads crashes Qt. Leave the process instead;
-            # settings and notes are already saved above.
+            # down running QThreads crashes Qt. Leave the process instead —
+            # settings are saved above, and the notes are saved now or the
+            # user has said what to do with them.
+            if not self._save_notes() and not self._settle_unsaved_notes():
+                self._call_off_close()
+                event.ignore()
+                return
             diagnostics.log_event("force quit while workers were running")
             os._exit(0)
         # The finish handlers call _quit_if_idle(), so no polling is needed.
         event.ignore()
+
+    def _close_with_notes_saved(self, event) -> None:
+        """Nothing is running: the last notes save, then the close itself."""
+        self._notes_save_timer.stop()
+        if not self._save_notes() and not self._settle_unsaved_notes():
+            self._call_off_close()
+            event.ignore()
+            return
+        self.stats_poller.stop()
+        self.stats_poller.wait(3000)
+        event.accept()
+
+    def _settle_unsaved_notes(self) -> bool:
+        """The final save failed: True to close once the notes are written
+        after all, written elsewhere, or knowingly discarded."""
+        self._asking_about_notes = True
+        try:
+            while True:
+                choice = self._ask_about_unsaved_notes()
+                if choice == "retry" and self._save_notes():
+                    return True
+                if choice == "elsewhere" and self._write_notes_copy("Save notes elsewhere"):
+                    return True
+                if choice == "discard":
+                    return True
+                if choice == "return":
+                    return False
+        finally:
+            self._asking_about_notes = False
+
+    def _ask_about_unsaved_notes(self) -> str:
+        """One prompt: "retry", "elsewhere", "return" or "discard"."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Notes not saved")
+        box.setText("Your latest notes could not be saved.")
+        box.setInformativeText(f"{self._notes_save_error}\n\nClosing now would lose them.")
+        retry = box.addButton("Retry", QMessageBox.ButtonRole.AcceptRole)
+        elsewhere = box.addButton("Save Elsewhere…", QMessageBox.ButtonRole.ActionRole)
+        back = box.addButton("Return to App", QMessageBox.ButtonRole.RejectRole)
+        discard = box.addButton("Close Without Saving", QMessageBox.ButtonRole.DestructiveRole)
+        choices = [(retry, "retry"), (elsewhere, "elsewhere"), (back, "return"),
+                   (discard, "discard")]
+        box.setDefaultButton(retry)
+        box.setEscapeButton(back)
+        box.exec()
+        clicked = box.clickedButton()
+        box.deleteLater()
+        return next((choice for button, choice in choices if button is clicked), "return")
+
+    def _call_off_close(self) -> None:
+        """Back to the app with the notes still in the editor. Any job told to
+        stop still finishes, and its handler resets the controls; stats still
+        poll and autosave still runs."""
+        self._quit_requested = False
+        self.statusBar().showMessage(
+            "Not closed: your notes are not saved yet. Export Notes… keeps a copy.")
