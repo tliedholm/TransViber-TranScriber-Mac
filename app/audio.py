@@ -11,8 +11,9 @@ timestamps put it: a stream that began a minute after the others starts
 with a minute of silence, and a stretch the recorder lost is silence too.
 Laying decoded audio end to end instead, as faster-whisper's own decoder
 does, moves everything after a gap earlier, and a late stream to 0:00 —
-and breaks the rule merging relies on, that every track's 0:00 is the same
-instant.
+which no single track offset can put right, since every stream and every
+stretch would need its own. This clock is the file's, not the session's:
+Track.offset still places the file on the session clock, in merge_tracks.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 
@@ -41,6 +43,7 @@ TIMING_TOLERANCE = 0.02     # seconds
 # beyond it is damage, not a recording that long, and decoding stops there
 # with an error instead of allocating silence for it.
 MAX_TIMELINE_SECONDS = 24 * 3600
+SILENCE_CHUNK_SECONDS = 10  # a long gap is handed out this much at a time
 
 
 class AudioFileError(ValueError):
@@ -56,13 +59,13 @@ class Timing:
 
     def summary(self) -> str:
         """One line for the user, or "" when there is nothing to say."""
-        from exporters import _hms
+        from exporters import hms
 
         notes = []
         if self.jumps:
             at = self.jumps[0][0]
-            where = (f"at {_hms(at)}" if len(self.jumps) == 1
-                     else f"in {len(self.jumps)} places, first at {_hms(at)}")
+            where = (f"at {hms(at)}" if len(self.jumps) == 1
+                     else f"in {len(self.jumps)} places, first at {hms(at)}")
             total = sum(back for _at, back in self.jumps)
             notes.append(f"Its timestamps jump back {where}. The audio there carries on "
                          f"from where it was, so later times may be off by up to "
@@ -254,7 +257,8 @@ def _timed_blocks(container, stream, path: Path, rate: int, layout: str | None,
     origin = _source_origin(container, path)
     # Decoded frames keep the stream's time base. Per frame the check is in
     # floats, which are exact enough to tell 20 ms from rounding; a run's
-    # position is worked out exactly, once.
+    # position is worked out exactly, once. (Fractions on every frame cost
+    # Align a tenth more time reading a file.)
     time_base = stream.time_base
     tick = float(time_base) if time_base else None
     resample = None
@@ -371,3 +375,41 @@ def decode_track_audio(path: Path, stream_index: int | None, channel: int | None
             size += len(samples)
     audio.resize(size, refcheck=False)
     return audio
+
+
+def iter_stream_power(path: Path, stream_index: int | None, rate: int,
+                      timing: Timing | None = None) -> Iterator[np.ndarray]:
+    """Decode one stream at `rate` as chunks of power summed over its channels.
+
+    For callers that measure loudness once, in passing — track alignment,
+    which reads whole files: nothing is held beyond one decoded chunk, where
+    a four-hour track at 16 kHz is close to a gigabyte. Every channel counts
+    in full. A mono downmix would not do: it gives an LFE-labelled channel
+    (the 4th of a 5.1 layout, the 3rd of a 2.1) no weight at all, and in a
+    multitrack file that channel can be someone's microphone.
+
+    On the file's own clock, like decode_track_audio: a gap is handed out
+    as zero power, SILENCE_CHUNK_SECONDS at a time, so a long one costs no
+    more memory than a short one and the caller can still cancel during it.
+    What that ran into is added to `timing`, when given.
+    """
+    import av
+
+    timing = timing if timing is not None else Timing()
+    with av.open(str(path)) as container:
+        stream = _audio_stream(container, path, stream_index)
+        # One-second chunks: left to itself the resampler hands back a few
+        # hundred samples at a time, and the per-chunk NumPy calls then cost
+        # twice what decoding does.
+        blocks = _timed_blocks(container, stream, path, rate, None, None, rate, timing)
+        for silence, samples in _placed(blocks, rate, path, timing):
+            while silence > 0:
+                chunk = min(silence, SILENCE_CHUNK_SECONDS * rate)
+                yield np.zeros(chunk)
+                silence -= chunk
+            # Per sample, before channels are summed: a filter gone unstable
+            # in one channel (NaN to the end of the file) must not take the
+            # healthy channels beside it down too.
+            samples = np.nan_to_num(samples.astype(np.float64),
+                                    nan=0.0, posinf=0.0, neginf=0.0)
+            yield np.sum(samples * samples, axis=1)

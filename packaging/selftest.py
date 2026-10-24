@@ -42,7 +42,7 @@ def check_bundle() -> list[str]:
         "ctranslate2", "mlx.core", "mlx_whisper", "mlx_qwen3_asr", "mlx_lm",
         "onnx_asr", "onnxruntime", "transformers", "huggingface_hub",
         "tqdm.std", "certifi", "tiktoken", "numba",
-        "main_window", "llm", "stats", "audio", "merger", "exporters",
+        "main_window", "llm", "stats", "audio", "align", "merger", "exporters",
         "diagnostics",
     ]
     for name in modules:

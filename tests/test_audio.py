@@ -5,8 +5,9 @@ keeps timestamps to the millisecond, a stream can begin after the others, a
 paused recorder leaves a gap in the timestamps, and two recordings joined end
 to end make them jump back. What used to happen to all of them is the same:
 the audio was laid end to end from 0:00, and everything after a gap or in a
-late stream moved earlier. Merging assumes every track's 0:00 is the same
-instant, so that broke the interleaving.
+late stream moved earlier. Merging places each file on the session clock
+with one offset per track, and no single offset can put that right. Align
+reads the same way (as power, through iter_stream_power).
 """
 
 import sys
@@ -21,7 +22,14 @@ import pytest
 
 import audio
 import transcriber
-from audio import SAMPLE_RATE, TIMING_TOLERANCE, AudioFileError, Timing, decode_track_audio
+from audio import (
+    SAMPLE_RATE,
+    TIMING_TOLERANCE,
+    AudioFileError,
+    Timing,
+    decode_track_audio,
+    iter_stream_power,
+)
 from models import Track
 from transcriber import Backend, TranscribeWorker
 
@@ -88,6 +96,11 @@ def loud_seconds(samples, rate: int = SAMPLE_RATE) -> list[int]:
     return [int(s) for s in np.flatnonzero(power.reshape(seconds, rate).mean(axis=1) > 1e-4)]
 
 
+def power_of(path: Path, stream_index=None, rate: int = 8000, timing=None):
+    """What Align hears: the stream's power, summed over its channels."""
+    return np.concatenate(list(iter_stream_power(path, stream_index, rate, timing)))
+
+
 # ---- following the timestamps -----------------------------------------------
 
 def test_a_gap_in_the_timestamps_stays_a_gap(tmp_path):
@@ -98,6 +111,9 @@ def test_a_gap_in_the_timestamps_stays_a_gap(tmp_path):
     assert len(decoded) == 6 * SAMPLE_RATE
     assert loud_seconds(decoded) == [0, 1, 4, 5]
     assert timing == Timing()           # a gap is no jump back
+    power = power_of(path)
+    assert len(power) == 6 * 8000
+    assert loud_seconds(np.sqrt(power), 8000) == [0, 1, 4, 5]
 
 
 def test_a_stream_that_began_late_keeps_its_leading_silence(tmp_path):
@@ -109,6 +125,7 @@ def test_a_stream_that_began_late_keeps_its_leading_silence(tmp_path):
     assert len(first) == len(second)
     assert loud_seconds(first) == list(range(90))
     assert loud_seconds(second) == list(range(60, 90))
+    assert loud_seconds(np.sqrt(power_of(path, 1)), 8000) == list(range(60, 90))
 
 
 def test_a_file_whose_clock_starts_at_ten_seconds_starts_at_zero(tmp_path):
@@ -134,24 +151,28 @@ def test_one_channel_keeps_the_same_time_as_the_whole_stream(tmp_path):
     assert loud_seconds(right) == [5, 6]
 
 
-def test_frame_size_moves_nothing_beyond_rounding(tmp_path):
-    # The same session cut into frames of three sizes: where the sound starts
-    # again after the gap agrees to within the timing tolerance, whatever the cut.
+def test_frame_size_and_rate_move_nothing_beyond_rounding(tmp_path):
+    # The same session cut into frames of three sizes and read at two rates
+    # (Align's power at 8 kHz, the engines' audio at 16 kHz): where the sound
+    # starts again after the gap agrees to within the timing tolerance,
+    # whatever the cut.
     found = []
     for frame in (480, 1024, 4800):
         path = write_mkv(tmp_path / f"cut{frame}.mkv",
                          [[(0, noise(3, 8)), (7.3, noise(2, 9))]], frame=frame)
-        power = np.square(decode_track_audio(path, None, None))
-        back = int(np.flatnonzero(power[3 * SAMPLE_RATE:] > 1e-4)[0]) + 3 * SAMPLE_RATE
-        found.append(back / SAMPLE_RATE)
-        assert len(power) / SAMPLE_RATE == pytest.approx(9.3, abs=1 / SAMPLE_RATE)
+        for rate in (8000, SAMPLE_RATE):
+            power = (power_of(path, rate=rate) if rate == 8000
+                     else np.square(decode_track_audio(path, None, None)))
+            back = int(np.flatnonzero(power[3 * rate:] > 1e-4)[0]) + 3 * rate
+            found.append(back / rate)
+            assert len(power) / rate == pytest.approx(9.3, abs=1 / rate)
     assert max(found) - min(found) <= TIMING_TOLERANCE
     assert np.mean(found) == pytest.approx(7.3, abs=TIMING_TOLERANCE)
 
 
 def test_an_ordinary_wav_decodes_exactly_as_before(tmp_path):
     # Zero-based, no gaps: sample for sample what laying the resampled audio
-    # end to end gave.
+    # end to end gave, at 16 kHz mono and as power at 8 kHz.
     import av
     from av.audio.resampler import AudioResampler
 
@@ -163,13 +184,19 @@ def test_an_ordinary_wav_decodes_exactly_as_before(tmp_path):
         out.setframerate(44100)
         out.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
 
-    chunks = []
-    with av.open(str(path)) as container:
-        resampler = AudioResampler(format="flt", layout="mono", rate=SAMPLE_RATE)
-        for frame in container.decode(audio=0):
-            chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(frame)]
-        chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(None)]
-    np.testing.assert_array_equal(decode_track_audio(path, None, None), np.concatenate(chunks))
+    def laid_end_to_end(**kwargs):
+        chunks = []
+        with av.open(str(path)) as container:
+            resampler = AudioResampler(format="flt", **kwargs)
+            for frame in container.decode(audio=0):
+                chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(frame)]
+            chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(None)]
+        return np.concatenate(chunks)
+
+    np.testing.assert_array_equal(decode_track_audio(path, None, None),
+                                  laid_end_to_end(layout="mono", rate=SAMPLE_RATE))
+    both = laid_end_to_end(layout="stereo", rate=8000).astype(np.float64).reshape(-1, 2)
+    np.testing.assert_array_equal(power_of(path), np.sum(both * both, axis=1))
 
 
 def test_joined_recordings_keep_every_sample_and_say_where(tmp_path):
@@ -185,6 +212,14 @@ def test_joined_recordings_keep_every_sample_and_say_where(tmp_path):
     assert "jump back at 0:05" in timing.summary()
 
 
+def test_a_long_gap_is_handed_out_a_little_at_a_time(tmp_path):
+    # An hour between two bursts: never an hour of samples in one piece.
+    path = write_mkv(tmp_path / "hour.mkv", [[(0, noise(1, 13)), (3601, noise(1, 14))]])
+    chunks = list(iter_stream_power(path, None, 8000))
+    assert max(len(c) for c in chunks) <= audio.SILENCE_CHUNK_SECONDS * 8000
+    assert sum(len(c) for c in chunks) == 3602 * 8000
+
+
 def test_a_timestamp_past_the_limit_is_an_error_not_an_allocation(tmp_path, monkeypatch):
     path = write_mkv(tmp_path / "far.mkv", [[(0, noise(1, 15)), (120, noise(1, 16))]])
     monkeypatch.setattr(audio, "MAX_TIMELINE_SECONDS", 60)
@@ -192,6 +227,8 @@ def test_a_timestamp_past_the_limit_is_an_error_not_an_allocation(tmp_path, monk
     monkeypatch.setattr(np, "zeros", zeros)
     with pytest.raises(AudioFileError, match="timing looks damaged") as caught:
         decode_track_audio(path, None, None)
+    with pytest.raises(AudioFileError, match="timing looks damaged"):
+        list(iter_stream_power(path, None, 8000))
     assert "far.mkv" in str(caught.value)
     assert all(np.prod(c.args[0]) <= 2 * 60 * SAMPLE_RATE for c in zeros.call_args_list)
 

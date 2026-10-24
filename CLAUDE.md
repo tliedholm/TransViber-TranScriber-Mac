@@ -12,11 +12,14 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   deps from `requirements-mac.txt`, then runs `packaging/preflight.py`).
   Launch: `./TransViber TransScriber.command` or
   `.venv/bin/python app/main.py`.
-- Tests: `.venv/bin/python -m pytest tests` (fast; no models or downloads).
-  `tests/test_track_status.py` builds a real `MainWindow` offscreen, with
-  settings in a scratch file and no stats thread; a new window test should
-  delete its window explicitly, since PySide6 6.11 can crash collecting a
-  closed one.
+- Tests: `.venv/bin/python -m pytest tests` (fast; no models or downloads;
+  `test_align.py`'s synthetic sessions take most of the ~25 s).
+  `tests/test_track_status.py` and `tests/test_offset_and_align_window.py`
+  build a real `MainWindow` offscreen, with settings in a scratch file and
+  no stats thread; a new window test should delete its window explicitly,
+  since PySide6 6.11 can crash collecting a closed one. The Align window
+  tests run the real `AlignWorker` thread with `run()` scripted and play the
+  review window by replacing only its `exec()`.
   Environment check: `.venv/bin/python packaging/preflight.py`.
 - Dependency versions are pinned in `requirements-mac.txt`; bump there and
   re-run tests + preflight + the frozen self-test before shipping.
@@ -46,8 +49,10 @@ to stay compatible with Windows, but the user may ask to port fixes across.
 
 - `main.py` — entry point. Also handles files opened from Finder: argv at
   launch (argv_emulation) and `QFileOpenEvent` for an already-running app.
-- `main_window.py` — all UI. Transcribe tab, live merged transcript, and
-  Notes tab with autosaved manual/local-AI notes.
+- `main_window.py` — all UI. Transcribe tab (track table with an editable
+  **Offset** column, **Align…**, the optional session-reference row above
+  the table), live merged transcript, and Notes tab with autosaved
+  manual/local-AI notes.
   `IS_MAC` switches the Device combo to "GPU (Metal)" (`"mlx"`) / CPU.
   Settings (model, language, vocab hints) persist via QSettings.
 - `diagnostics.py` — rotating log at
@@ -115,10 +120,21 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   streams -> track per stream; >2 channels -> track per channel; stereo split
   is a right-click action). `decode_track_audio()` -> mono float32 16 kHz,
   on the file's own clock (see the invariants), reporting what it ran into
-  in a `Timing`.
-- `merger.py` / `exporters.py` — chronological merge, same-speaker
-  coalescing, and md/txt/srt/vtt/json exporters. `merge_tracks()` skips
-  `ERROR` tracks: an engine can emit segments and *then* raise, and those
+  in a `Timing`. `iter_stream_power()` is Align's reader: the same clock,
+  as chunks of power summed over every channel (a mono downmix gives an
+  LFE-labelled channel no weight, and in a multitrack file that channel can
+  be someone's mic), with long gaps handed out `SILENCE_CHUNK_SECONDS` at a
+  time so Align stays cancellable.
+- `align.py` — track offsets: `parse_offset`/`format_offset` for the Offset
+  column, and Align (`AlignWorker`, `find_offset`, `suggest_offsets`), which
+  suggests offsets from sound the recordings share. See "Track alignment".
+  It is a copy of the PC edition's module (only the module note differs);
+  keep it that way so fixes port both ways.
+- `merger.py` / `exporters.py` — chronological merge (each track's offset
+  added to copies of its segments), same-speaker coalescing, and
+  md/txt/srt/vtt/json exporters; the JSON records each track's `offset` and
+  `offset_source`. `merge_tracks()` skips `ERROR` tracks: an engine can
+  emit segments and *then* raise, and those
   partial segments would make an incomplete track read as finished. They
   stay on the Track (the UI reports the count) but never reach the
   transcript or an export. Speaker names are escaped per format.
@@ -137,13 +153,31 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   and transcribes only speech regions, then restores each region's original
   timeline offset. This is required because speech mixed with long silence
   can make Qwen repeat text and corrupt forced-aligned timestamps.
-- All tracks are assumed to start at the same instant (multitrack recorder
-  convention); merging is a sort by segment start time.
+- **Offsets live in one place.** Segment times inside a track stay relative
+  to its own file; `Track.offset` is when that file began on the session
+  clock (someone who joined late, or recorded on another device), and
+  `merge_tracks` adds it to *copies* of the segments, then sorts by start.
+  So an offset edit never needs a re-transcription, can't be applied twice,
+  and reaches the live view, AI notes and every export through that one
+  function: never bake one into `track.segments` (or into a rerun's
+  stash). An offset is the file's start, not the first word; offsets are
+  never negative and never inferred from file length. With every offset at
+  zero (Craig/OBS/REAPER exports, which pad late joiners) output is
+  identical to before offsets existed. `OffsetSource` records how each was
+  set (default, typed, matched, guessed); a typed value, a typed 0
+  included, is the user's and is protected. Typed edits commit through
+  `_OffsetDelegate`, not `itemChanged`: Qt drops a write of unchanged text,
+  and retyping the shown `0:00` must still count as typed.
 - **Decode on the file's own clock.** Every engine, faster-whisper included,
   is handed `decode_track_audio`'s array, never a path: faster-whisper's own
   decoder lays audio end to end, so a stream that began late in its file
   lands at 0:00 and everything after a gap in the timestamps moves earlier,
-  which breaks the same-instant rule above. `audio.py` measures every stream
+  and no single offset can repair that, since each stream and each stretch
+  would need its own. Align summed a file's streams from sample 0 the same
+  way, and a file whose second stream began a minute late matched strongly,
+  a minute out. Two clocks, kept apart: the *source clock*, one 0:00 for
+  every stream in a file, and the *session clock*, which `Track.offset`
+  maps the file onto in `merge_tracks`. `audio.py` measures every stream
   in a file from one 0:00 (`container.start_time`, or the earliest packet
   timestamp when the file declares none) and places each run of frames by
   its timestamp: within `TIMING_TOLERANCE` (20 ms) it follows on; later is a
@@ -199,3 +233,82 @@ to stay compatible with Windows, but the user may ask to port fixes across.
 - Primary use: transcribing D&D sessions (Discord/Craig multitrack
   recordings); vocab hints hold campaign names.
 - Everything must stay free/local/unlimited — no cloud transcription APIs.
+
+## Track alignment
+
+**Align…** suggests offsets from sound the recordings share, and applies
+only what the user ticks in its review window (`AlignReviewDialog`).
+Nothing is ever applied automatically; a typed value is the undo. No model
+and no GPU: it only reads the files.
+
+- **Evidence.** `AlignWorker` decodes each stream once through
+  `audio.iter_stream_power` at 8 kHz, on the file's clock (a file is one
+  unit: all its rows, their streams' energies summed where each began),
+  keeping only a 100-per-second *onset fingerprint*: the rises in log
+  frame energy, less a 1 s moving average. `find_offset` slides one
+  fingerprint along another with FFT normalised cross-correlation. Rises,
+  not loudness itself: an isolated speaker file and a mix share that
+  speaker's syllable onsets while other voices fill the mix.
+- **Reuse.** Decoding is most of Align's time, so the window keeps each
+  fingerprint from the last run, keyed by path and streams and stamped with
+  the file's modified time and size; an unchanged file is not decoded
+  again. Only files loaded when Align is pressed keep theirs. Within one
+  `find_offset`, `_Transforms` works out the reference's FFT once per size.
+- **Trust.** The label comes from peak ÷ best score more than 0.5 s away:
+  strong ≥ `MATCH_RATIO` (ticked), weak ≥ `WEAK_RATIO` (unticked), else no
+  match. Lags are only scored where the files overlap by
+  `MIN_OVERLAP_SECONDS` (120 s, or half the shorter file), a strong label
+  needs `STRONG_MIN_OVERLAP_SECONDS` (240 s, or 90% of the shorter file),
+  and each file needs `MIN_ACTIVE_SECONDS` of sound inside the overlap
+  (above both a tenth of the busiest seconds and `SOUND_ENERGY`, so hiss and
+  digital silence are not sound). A strong match is then searched for again
+  in parts of the overlap (`_part_verdict`): the first and last third,
+  sixth, twelfth and 80 s, each on its own, which reaches a cut down to about
+  40 s from either end. The two 80 s parts run from 160 s of overlap, where
+  they no longer overlap (`_part_sizes`); under 160 s nothing can check for
+  an edit, so such a match is offered as weak, "too short to check for an
+  edit" (against a session reference, a reason from the stretches comes
+  first). A part downgrades the match when its clear peak lands more than
+  `CONSISTENCY_SECONDS` away, or when it has two real peaks with the
+  whole-file lag one of them (a part straddling a cut). Against a session
+  reference a strong match also needs two separate stretches of the file's
+  *active* audio to agree. `suggest_offsets` chains only through strong
+  matches; a weak one is kept as that file's suggestion and never places
+  another file. A file with no match gets the "stopped together" guess,
+  labelled as one. Guesses start unticked, and so does any file with a typed
+  value on any of its rows.
+- **Session reference.** `MainWindow.session_reference` is a
+  `SessionReference`, deliberately not a `Track`: never transcribed,
+  exported, counted or sent to AI Notes. Its start is session 0:00 and never
+  moves; a file matched before it gets a reason and no checkbox. Without
+  one, the longest speaker file is the reference, anchored on its current
+  offset. If the reference or a strong match would land before 0:00, every
+  row moves later by the same amount; weak rows never drive that shift.
+  `AlignmentResult.measured` keeps the rows relative to the reference so
+  `rebase()` can re-anchor without re-matching, which the window does when
+  the reference file's offset was typed while Align ran. When the clock
+  moves and a file with an offset of its own would start unticked, nothing
+  starts ticked, since applying the others alone would leave that file
+  behind. The same file can't hold both roles: `_canonical` keys files by
+  their identity on disk (a Mac disk ignores letter case), checked in both
+  import routes.
+- **Busy state.** `_tracks_locked()` covers transcription, alignment and the
+  review window: Add/Remove/Clear/split are disabled while any of them runs
+  (a file opened from Finder then is refused with a status-bar message),
+  and the reference controls from Align until the review closes. Offset
+  edits, Transcribe and AI Notes stay available during Align. The review
+  waits for any other modal prompt to close first, commits an Offset still
+  being typed before reading "Now", and Export merges again right before
+  each write. A quit stops a running Align (it checks between decoded
+  chunks and between matches) and never opens the review.
+- **Calibration status.** The thresholds are provisional. On synthetic
+  energy sessions true matches scored about 3.3–24 and 1,200 unrelated
+  pairs at most 1.89 (some weak, none strong); over about 12,000 unrelated
+  pairs the ratio alone reached 2.3, always at about 120 s of overlap, so it
+  is the 240 s strong-overlap rule, not `MATCH_RATIO`, that keeps those
+  weak: recalibrate the two together. On espeak-synthesised four-speaker
+  speech, isolated files against the mix scored 3.7–12.4, same-room bleed
+  7.4–8.2 and unrelated headset files 1.08–1.25. None of that is a real
+  recording: calibrate on real sessions, mix-versus-isolated kept separate
+  from shared-room, before trusting them. These figures come from the PC
+  edition, which shares this module.
