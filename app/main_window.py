@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 
 import diagnostics
 import exporters
+import llm
 from align import (
     CONSISTENCY_SECONDS,
     SESSION_REFERENCE,
@@ -724,6 +725,22 @@ class MainWindow(QMainWindow):
         return (f"{model} can't transcribe {language}. Choose another language "
                 f"or Auto-detect, or a Whisper model for {language}.")
 
+    def _update_notes_model_choices(self) -> None:
+        """Grey out the notes models this Mac's GPU can't hold.
+
+        A saved or typed one stays in the box; AI Notes refuses it, and the
+        worker does again before loading anything.
+        """
+        budget = llm.gpu_budget()
+        items = self.combo_notes_model.model()
+        for row in range(self.combo_notes_model.count()):
+            name = self.combo_notes_model.itemText(row)
+            if name not in llm.LLM_REPOS:
+                continue  # a tier heading or separator
+            shortfall = llm.gpu_shortfall(name, budget)
+            items.item(row).setEnabled(shortfall is None)
+            items.item(row).setToolTip(shortfall or "")
+
     def _make_star_button(self, combo: QComboBox, settings_key: str) -> QPushButton:
         """Flat ☆/★ toggle pinning the combo's current model as startup default."""
         btn = QPushButton("☆")
@@ -778,11 +795,12 @@ class MainWindow(QMainWindow):
         self.combo_notes_model = QComboBox()
         self.combo_notes_model.setEditable(True)
         _add_grouped_models(self.combo_notes_model, NOTES_MODEL_GROUPS)
+        self._update_notes_model_choices()
         self.combo_notes_model.setCurrentText(DEFAULT_NOTES_MODEL)
         self.combo_notes_model.setToolTip(
             "Local LLM (4-bit MLX, Apple GPU) that writes notes on the\n"
             "merged transcript. Bigger tiers give richer notes, slower.\n"
-            "Experimental models may be slow or fail on a 16 GB Mac.\n"
+            "Models greyed out need more memory than this Mac has.\n"
             "Type any MLX repo id (e.g. from mlx-community) for other models."
         )
         model_row.addWidget(self.combo_notes_model, 1)
@@ -939,6 +957,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, "No transcript",
                 "Transcribe something first — AI notes are written on the merged transcript.")
+            return
+        shortfall = llm.gpu_shortfall(self.combo_notes_model.currentText(),
+                                      llm.gpu_budget())
+        if shortfall is not None:
+            QMessageBox.warning(self, "Notes model too big for this Mac", shortfall)
             return
         transcript = exporters.to_text(segments)
         if self.notes_edit.toPlainText().strip():
