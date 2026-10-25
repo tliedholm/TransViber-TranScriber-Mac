@@ -373,7 +373,7 @@ def test_return_to_app_puts_everything_back(window, notes):
     assert window.btn_ai_notes.text() == "AI Notes"
     assert window.btn_ai_notes.isEnabled()
     assert window.btn_transcribe.isEnabled()
-    assert not window._notes_elapsed_timer.isActive()
+    assert not window._notes_clock.timer.isActive()
     assert "*(cancelled)*" in window.notes_edit.toPlainText()
     assert "not saved" in window.statusBar().currentMessage()
     window.notes_edit.appendPlainText("More.")
@@ -417,7 +417,6 @@ def test_a_transcription_that_dies_without_finishing_resets_the_controls(
         def run(self):
             pass
     monkeypatch.setattr(main_window, "TranscribeWorker", DyingTranscription)
-    monkeypatch.setattr(main_window.llm, "free_llm", lambda: None)
     track = Track(Path("bob.wav"), "Bob")
     window.tracks.append(track)
     window._append_row(track)

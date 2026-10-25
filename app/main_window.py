@@ -6,9 +6,10 @@ import html
 import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer, Slot
+from PySide6.QtCore import QSettings, QSignalBlocker, Qt, QTimer, Slot
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemDelegate,
@@ -39,7 +40,6 @@ from PySide6.QtWidgets import (
 
 import diagnostics
 import exporters
-import llm
 from align import (
     CONSISTENCY_SECONDS,
     SESSION_REFERENCE,
@@ -49,7 +49,7 @@ from align import (
     parse_offset,
     rebase,
 )
-from audio import _channel_suffixes, probe_streams, tracks_for_file
+from audio import channel_tracks, probe_streams, tracks_for_file
 from llm import DEFAULT_NOTES_MODEL, NOTES_MODEL_GROUPS, NotesWorker
 from merger import coalesce, discarded_segment_count, merge_tracks
 from models import (
@@ -59,6 +59,7 @@ from models import (
     SessionReference,
     Track,
     TrackStatus,
+    audio_paths,
 )
 from stats import StatsPoller
 from transcriber import (
@@ -66,7 +67,7 @@ from transcriber import (
     cuda_available,
     engine_for,
     language_supported,
-    mlx_available,
+    mlx_installed,
 )
 
 IS_MAC = sys.platform == "darwin"
@@ -158,11 +159,39 @@ EXPORT_FILTERS = (
 )
 
 
-def _fmt_duration(seconds: float) -> str:
-    s = int(seconds)
-    h, rem = divmod(s, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+def _token_readout(tokens: int, tps: float) -> str:
+    """'1,234 tok · 18 tok/s', the speed left out until there is one."""
+    return f"{tokens:,} tok" + (f" · {tps:.0f} tok/s" if tps > 0 else "")
+
+
+class _RunClock:
+    """A run's elapsed time in a label: ticking while it runs, then "took …"."""
+
+    def __init__(self, label: QLabel, parent) -> None:
+        self.label = label
+        self.started: float | None = None
+        self.timer = QTimer(parent)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self._tick)
+
+    def start(self) -> None:
+        self.started = time.monotonic()
+        self.label.setText("0:00")
+        self.timer.start()
+
+    def stop(self) -> str:
+        """Show how long the run took, and return it ("" if none was running)."""
+        self.timer.stop()
+        if self.started is None:
+            return ""
+        elapsed = exporters.hms(time.monotonic() - self.started)
+        self.label.setText(f"took {elapsed}")
+        self.started = None
+        return elapsed
+
+    def _tick(self) -> None:
+        if self.started is not None:
+            self.label.setText(exporters.hms(time.monotonic() - self.started))
 
 
 def _canonical(path: Path):
@@ -387,8 +416,9 @@ class MainWindow(QMainWindow):
         # Fingerprints from the last Align, by (path, streams), for the files
         # it read: one unchanged since isn't decoded again (see AlignWorker).
         self._align_fingerprints: dict = {}
-        self.has_cuda = not IS_MAC and cuda_available()
-        self.has_mlx = mlx_available()
+        # The merged transcript as last drawn, and the views not yet showing it.
+        self._transcript_html = ""
+        self._stale_views: set = set()
         # Set once the user asks to quit while a worker is still running; the
         # close is completed by _quit_if_idle() when the worker really stops.
         self._quit_requested = False
@@ -408,6 +438,8 @@ class MainWindow(QMainWindow):
     # ---------- UI construction ----------
 
     def _build_ui(self) -> None:
+        has_cuda = not IS_MAC and cuda_available()
+        has_mlx = mlx_installed()
         central = QWidget()
         root = QVBoxLayout(central)
 
@@ -468,7 +500,7 @@ class MainWindow(QMainWindow):
         if IS_MAC:
             self.combo_device.addItem("GPU (Metal)", "mlx")
             self.combo_device.addItem("CPU", "cpu")
-            if not self.has_mlx:
+            if not has_mlx:
                 self.combo_device.setToolTip(
                     "Whisper models need mlx-whisper for the GPU (run setup_mac.sh);\n"
                     "without it they run on CPU. Parakeet/Canary always run on CPU\n"
@@ -476,9 +508,9 @@ class MainWindow(QMainWindow):
                 )
         else:
             self.combo_device.addItem(
-                "GPU (CUDA)" if self.has_cuda else "GPU (unavailable)", "cuda")
+                "GPU (CUDA)" if has_cuda else "GPU (unavailable)", "cuda")
             self.combo_device.addItem("CPU", "cpu")
-            if not self.has_cuda:
+            if not has_cuda:
                 self.combo_device.model().item(0).setEnabled(False)
                 self.combo_device.setCurrentIndex(1)
         bar.addWidget(self.combo_device)
@@ -488,10 +520,7 @@ class MainWindow(QMainWindow):
         self.elapsed_label = QLabel("")
         self.elapsed_label.setToolTip("How long the current or last transcription run took.")
         bar.addWidget(self.elapsed_label)
-        self._run_started: float | None = None
-        self._elapsed_timer = QTimer(self)
-        self._elapsed_timer.setInterval(1000)
-        self._elapsed_timer.timeout.connect(self._tick_elapsed)
+        self._run_clock = _RunClock(self.elapsed_label, self)
         self.btn_transcribe = QPushButton("Transcribe")
         self.btn_transcribe.setDefault(True)
         self.btn_transcribe.clicked.connect(self.toggle_transcription)
@@ -593,11 +622,14 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(central, "Transcribe")
         self.tabs.addTab(self._build_notes_page(), "Notes")
         self.setCentralWidget(self.tabs)
+        self.tabs.currentChanged.connect(lambda _index: self._sync_transcript_views())
+        self.check_show_transcript.toggled.connect(
+            lambda _shown: self._sync_transcript_views())
 
         if IS_MAC:
-            device_text = ("GPU: Apple Silicon (Metal)" if self.has_mlx
+            device_text = ("GPU: Apple Silicon (Metal)" if has_mlx
                            else "GPU: unavailable (mlx-whisper not installed)")
-        elif self.has_cuda:
+        elif has_cuda:
             device_text = "GPU: CUDA available"
         else:
             device_text = "GPU not available — using CPU"
@@ -637,25 +669,29 @@ class MainWindow(QMainWindow):
         if not text and self._last_summary:
             self.statusBar().showMessage(self._last_summary)
 
-    def _on_download_progress(self, percent: int, total_gb: float) -> None:
+    def _set_summary(self, msg: str) -> None:
+        """Show a finished run's summary, kept in the status bar until the next run."""
+        self._last_summary = msg
+        self.statusBar().showMessage(msg)
+
+    def _on_download_progress(self, model: str, percent: int, total_gb: float) -> None:
+        """The shared download readout; `model` is the downloading job's own,
+        bound when it started, not whatever its combo box says now."""
         if percent < 0:
             self.download_label.setText("")
-        elif total_gb >= 0.05:
-            self.download_label.setText(f"Downloading model: {percent}% of {total_gb:.1f} GB")
-        else:
-            self.download_label.setText(f"Downloading model: {percent}%")
-        if percent >= 0:
-            model = (self.combo_notes_model.currentText().strip()
-                     if self.notes_worker is not None
-                     else self.combo_model.currentText().strip())
-            size = f" of {total_gb:.1f} GB" if total_gb >= 0.05 else ""
-            self.statusBar().showMessage(
-                f"Downloading model '{model}' — {percent}%{size}…")
+            return
+        size = f" of {total_gb:.1f} GB" if total_gb >= 0.05 else ""
+        self.download_label.setText(f"Downloading model: {percent}%{size}")
+        self.statusBar().showMessage(f"Downloading model '{model}' — {percent}%{size}…")
+
+    @staticmethod
+    def _apply_color_scheme(dark: bool) -> None:
+        QGuiApplication.styleHints().setColorScheme(
+            Qt.ColorScheme.Dark if dark else Qt.ColorScheme.Light)
 
     def _set_dark_mode(self, dark: bool) -> None:
         """Apply and remember an explicit appearance choice."""
-        QGuiApplication.styleHints().setColorScheme(
-            Qt.ColorScheme.Dark if dark else Qt.ColorScheme.Light)
+        self._apply_color_scheme(dark)
         QSettings().setValue("dark", dark)
 
     def _update_hints_visibility(self) -> None:
@@ -831,11 +867,8 @@ class MainWindow(QMainWindow):
         self.notes_edit.textChanged.connect(self._on_notes_changed)
 
         self.notes_worker: NotesWorker | None = None
-        self._notes_started: float | None = None
         self._notes_last_progress: tuple[int, float] | None = None  # (tokens, tok/s)
-        self._notes_elapsed_timer = QTimer(self)
-        self._notes_elapsed_timer.setInterval(1000)
-        self._notes_elapsed_timer.timeout.connect(self._tick_notes_elapsed)
+        self._notes_clock = _RunClock(self.notes_elapsed_label, self)
         return page
 
     def _on_notes_changed(self) -> None:
@@ -866,11 +899,6 @@ class MainWindow(QMainWindow):
             return False
         self._notes_dirty = False
         return True
-
-    def _tick_notes_elapsed(self) -> None:
-        if self._notes_started is not None:
-            self.notes_elapsed_label.setText(
-                self._format_elapsed(time.monotonic() - self._notes_started))
 
     def export_notes_dialog(self) -> None:
         if not self.notes_edit.toPlainText().strip():
@@ -912,7 +940,7 @@ class MainWindow(QMainWindow):
                 self, "No transcript",
                 "Transcribe something first — AI notes are written on the merged transcript.")
             return
-        transcript = exporters.to_text(coalesce(segments))
+        transcript = exporters.to_text(segments)
         if self.notes_edit.toPlainText().strip():
             self._append_notes_chunk("\n\n")
         self.notes_worker = NotesWorker(
@@ -922,7 +950,7 @@ class MainWindow(QMainWindow):
         )
         w = self.notes_worker
         w.status.connect(self.statusBar().showMessage)
-        w.download_progress.connect(self._on_download_progress)
+        w.download_progress.connect(partial(self._on_download_progress, w.model_name))
         w.chunk.connect(self._append_notes_chunk)
         w.progress.connect(self._on_notes_progress)
         w.completed.connect(self._on_notes_done)
@@ -933,12 +961,10 @@ class MainWindow(QMainWindow):
         # until notes finish (the reverse holds in toggle_transcription).
         self.btn_transcribe.setEnabled(False)
         self.btn_ai_notes.setText("Cancel notes")
-        self.notes_progress.setText("0% · 0 tok")
+        self.notes_progress.setText(f"0% · {_token_readout(0, 0.0)}")
         self._last_summary = ""
         self._notes_last_progress = None
-        self._notes_started = time.monotonic()
-        self.notes_elapsed_label.setText("0:00")
-        self._notes_elapsed_timer.start()
+        self._notes_clock.start()
         w.start()
 
     def _append_notes_chunk(self, text: str) -> None:
@@ -949,20 +975,14 @@ class MainWindow(QMainWindow):
         self.notes_edit.ensureCursorVisible()
 
     def _on_notes_progress(self, percent: int, tokens: int, tps: float) -> None:
-        speed = f" · {tps:.0f} tok/s" if tps > 0 else ""
         self._notes_last_progress = (tokens, tps)
-        self.notes_progress.setText(f"{percent}% · {tokens:,} tok{speed}")
+        self.notes_progress.setText(f"{percent}% · {_token_readout(tokens, tps)}")
 
     def _finish_notes_run(self) -> str:
         if self.notes_worker is not None:
             self.notes_worker.wait()
             self.notes_worker = None
-        self._notes_elapsed_timer.stop()
-        elapsed = ""
-        if self._notes_started is not None:
-            elapsed = self._format_elapsed(time.monotonic() - self._notes_started)
-            self.notes_elapsed_label.setText(f"took {elapsed}")
-            self._notes_started = None
+        elapsed = self._notes_clock.stop()
         self.btn_ai_notes.setText("AI Notes")
         self.btn_ai_notes.setEnabled(True)
         self.btn_transcribe.setEnabled(self.worker is None)
@@ -976,38 +996,29 @@ class MainWindow(QMainWindow):
         if elapsed:
             msg += f" — took {elapsed}"
         if self._notes_last_progress is not None:
-            tokens, tps = self._notes_last_progress
-            msg += f" · {tokens:,} tok"
-            if tps > 0:
-                msg += f" · {tps:.0f} tok/s"
-        self._last_summary = msg
-        self.statusBar().showMessage(msg)
+            msg += " · " + _token_readout(*self._notes_last_progress)
+        self._set_summary(msg)
 
     def _on_notes_failed(self, error: str) -> None:
         elapsed = self._finish_notes_run()
         self.notes_progress.setText("")
-        msg = f"AI notes failed — took {elapsed}" if elapsed else "AI notes failed"
-        self._last_summary = msg
-        self.statusBar().showMessage(msg)
+        self._set_summary(f"AI notes failed — took {elapsed}" if elapsed
+                          else "AI notes failed")
         if not self._quit_requested:
             QMessageBox.warning(self, "AI notes failed", error)
 
     # ---------- Drag & drop ----------
 
+    @staticmethod
+    def _dropped_audio(event) -> list[Path]:
+        return audio_paths(url.toLocalFile() for url in event.mimeData().urls())
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if not self._tracks_locked() and any(
-            Path(u.toLocalFile()).suffix.lower() in AUDIO_EXTENSIONS
-            for u in event.mimeData().urls()
-        ):
+        if not self._tracks_locked() and self._dropped_audio(event):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        paths = [
-            Path(u.toLocalFile())
-            for u in event.mimeData().urls()
-            if Path(u.toLocalFile()).suffix.lower() in AUDIO_EXTENSIONS
-        ]
-        self.add_files(paths)
+        self.add_files(self._dropped_audio(event))
 
     # ---------- Track management ----------
 
@@ -1065,33 +1076,32 @@ class MainWindow(QMainWindow):
     def _append_row(self, track: Track, row: int | None = None) -> None:
         if row is None:
             row = self.table.rowCount()
-        self.table.blockSignals(True)
-        self.table.insertRow(row)
+        with QSignalBlocker(self.table):
+            self.table.insertRow(row)
 
-        speaker_item = QTableWidgetItem(track.speaker)
-        self.table.setItem(row, COL_SPEAKER, speaker_item)
-        offset_item = QTableWidgetItem(format_offset(track.offset))
-        offset_item.setToolTip(OFFSET_SOURCE_TIPS[track.offset_source])
-        self.table.setItem(row, COL_OFFSET, offset_item)
+            speaker_item = QTableWidgetItem(track.speaker)
+            self.table.setItem(row, COL_SPEAKER, speaker_item)
+            offset_item = QTableWidgetItem(format_offset(track.offset))
+            offset_item.setToolTip(OFFSET_SOURCE_TIPS[track.offset_source])
+            self.table.setItem(row, COL_OFFSET, offset_item)
 
-        for col, text in [
-            (COL_FILE, track.source_label),
-            (COL_DURATION, _fmt_duration(track.duration)),
-            (COL_STATUS, track.status.value),
-        ]:
-            item = QTableWidgetItem(text)
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if col == COL_FILE:
-                item.setToolTip(str(track.path))
-            elif col == COL_STATUS and track.probe_error:
-                item.setToolTip("This file could not be probed:\n" + track.probe_error)
-            self.table.setItem(row, col, item)
+            for col, text in [
+                (COL_FILE, track.source_label),
+                (COL_DURATION, exporters.hms(track.duration)),
+                (COL_STATUS, track.status.value),
+            ]:
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if col == COL_FILE:
+                    item.setToolTip(str(track.path))
+                elif col == COL_STATUS and track.probe_error:
+                    item.setToolTip("This file could not be probed:\n" + track.probe_error)
+                self.table.setItem(row, col, item)
 
-        progress = QProgressBar()
-        progress.setRange(0, 100)
-        progress.setValue(0)
-        self.table.setCellWidget(row, COL_PROGRESS, progress)
-        self.table.blockSignals(False)
+            progress = QProgressBar()
+            progress.setRange(0, 100)
+            progress.setValue(0)
+            self.table.setCellWidget(row, COL_PROGRESS, progress)
 
     def _show_offset(self, row: int) -> None:
         """Write a track's offset into its cell, in standard form."""
@@ -1129,18 +1139,12 @@ class MainWindow(QMainWindow):
         new_name = item.text().strip()
         if not new_name:
             # A blank cell used to leave the track named and the table empty.
-            self.table.blockSignals(True)
-            item.setText(track.speaker)
-            self.table.blockSignals(False)
+            with QSignalBlocker(self.table):
+                item.setText(track.speaker)
             self.statusBar().showMessage("A speaker needs a name — kept "
                                          f"'{track.speaker}'.", 4000)
             return
-        track.speaker = new_name
-        for seg in track.segments:
-            seg.speaker = new_name
-        if track.previous is not None:  # a rerun is in flight; rename the stash too
-            for seg in track.previous.segments:
-                seg.speaker = new_name
+        track.speaker = new_name  # merge_tracks names the segments after it
         self._schedule_refresh()
 
     def _show_table_menu(self, pos) -> None:
@@ -1170,11 +1174,10 @@ class MainWindow(QMainWindow):
             return
         self.table.removeRow(row)
         del self.tracks[row]
-        for ch, suffix in enumerate(_channel_suffixes(channels)):
-            new = Track(path=track.path, speaker=track.speaker + suffix,
-                        duration=track.duration, stream_index=track.stream_index,
-                        channel=ch, offset=track.offset,
-                        offset_source=track.offset_source)
+        for ch, new in enumerate(channel_tracks(
+                track.path, track.speaker, channels, duration=track.duration,
+                stream_index=track.stream_index, offset=track.offset,
+                offset_source=track.offset_source)):
             self.tracks.insert(row + ch, new)
             self._append_row(new, row + ch)
         self._schedule_refresh()
@@ -1186,6 +1189,7 @@ class MainWindow(QMainWindow):
         for row in rows:
             self.table.removeRow(row)
             del self.tracks[row]
+        self._prune_align_fingerprints()
         self._schedule_refresh()
 
     def clear_tracks(self) -> None:
@@ -1193,22 +1197,27 @@ class MainWindow(QMainWindow):
             return
         # Clearing is the one button that can destroy hours of transcription
         # in a single click, so it asks once there is something to lose.
-        if merge_tracks(self.tracks, include_failed=True):
-            answer = QMessageBox.question(
-                self, "Clear the transcript?",
+        if any(t.segments for t in self.tracks) and not self._confirm(
+                "Clear the transcript?",
                 "This removes every track and the merged transcript.\n"
-                "Export first if you want to keep it.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel)
-            if answer != QMessageBox.StandardButton.Yes:
-                return
+                "Export first if you want to keep it."):
+            return
         self.table.setRowCount(0)
         self.tracks.clear()
         self.session_reference = None
         self._show_session_reference()
-        self.transcript_view.clear()
-        self.notes_transcript_view.clear()  # the notes text itself stays
+        self._prune_align_fingerprints()
+        self._render_transcript()  # empties both views; the notes text itself stays
         self.btn_export.setEnabled(False)
+
+    def _prune_align_fingerprints(self) -> None:
+        """Let go of what Align read from files no longer loaded: a four-hour
+        file's fingerprint is about 11 MB, kept otherwise until the next Align."""
+        loaded = {t.path for t in self.tracks}
+        if self.session_reference is not None:
+            loaded.add(self.session_reference.path)
+        self._align_fingerprints = {key: kept for key, kept in self._align_fingerprints.items()
+                                    if key[0] in loaded}
 
     # ---------- Session reference ----------
 
@@ -1245,6 +1254,7 @@ class MainWindow(QMainWindow):
         self.session_reference = SessionReference(
             path, max(s["duration"] for s in streams), len(streams))
         self._show_session_reference()
+        self._prune_align_fingerprints()
         self.statusBar().showMessage(
             f"Session reference: {path.name}. Click Align… to time the speaker "
             f"files against it; offsets already set stay as they are.", 10000)
@@ -1255,6 +1265,7 @@ class MainWindow(QMainWindow):
             return
         self.session_reference = None
         self._show_session_reference()
+        self._prune_align_fingerprints()
         self.statusBar().showMessage(
             "Session reference removed. Offsets already set stay as they are.", 8000)
 
@@ -1471,14 +1482,11 @@ class MainWindow(QMainWindow):
         finished = [i for i, t in enumerate(self.tracks) if t.status == TrackStatus.DONE]
 
         if not unfinished:
-            answer = QMessageBox.question(
-                self, "Transcribe everything again?",
-                f"All {len(finished)} track(s) are already transcribed.\n\n"
-                "Running again replaces the existing transcript. The current "
-                "one is kept until the new run succeeds.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel)
-            if answer != QMessageBox.StandardButton.Yes:
+            if not self._confirm(
+                    "Transcribe everything again?",
+                    f"All {len(finished)} track(s) are already transcribed.\n\n"
+                    "Running again replaces the existing transcript. The current "
+                    "one is kept until the new run succeeds."):
                 return None
             return list(range(len(self.tracks)))
 
@@ -1494,23 +1502,20 @@ class MainWindow(QMainWindow):
         if not changed:
             return unfinished
 
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Settings changed since the finished tracks")
-        box.setText("The " + ", ".join(changed) + " changed since "
-                    f"{len(finished)} track(s) were transcribed.")
-        box.setInformativeText(
+        choice = self._choose(
+            "Settings changed since the finished tracks",
+            "The " + ", ".join(changed) + " changed since "
+            f"{len(finished)} track(s) were transcribed.",
             "Transcribing only the remaining tracks would mix results from "
-            "different settings in one transcript.")
-        rerun = box.addButton("Redo all tracks", QMessageBox.ButtonRole.AcceptRole)
-        remaining = box.addButton("Only the remaining tracks",
-                                  QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(rerun)
-        box.exec()
-        if box.clickedButton() is rerun:
+            "different settings in one transcript.",
+            [("Redo all tracks", QMessageBox.ButtonRole.AcceptRole, "all"),
+             ("Only the remaining tracks", QMessageBox.ButtonRole.DestructiveRole,
+              "remaining"),
+             (QMessageBox.StandardButton.Cancel, None, None)],
+            default="all")
+        if choice == "all":
             return list(range(len(self.tracks)))
-        if box.clickedButton() is remaining:
+        if choice == "remaining":
             return unfinished
         return None
 
@@ -1556,12 +1561,12 @@ class MainWindow(QMainWindow):
             self.tracks, indices,
             model_name=wanted.model,
             device=wanted.device,
-            language=self.combo_lang.currentData(),
-            hotwords=self.edit_hints.toPlainText(),
+            language=wanted.language or None,
+            hotwords=wanted.hints,
         )
         w = self.worker
         w.model_status.connect(self.statusBar().showMessage)
-        w.download_progress.connect(self._on_download_progress)
+        w.download_progress.connect(partial(self._on_download_progress, w.model_name))
         w.track_started.connect(self._on_track_started)
         w.segment_ready.connect(self._on_segment)
         w.track_progress.connect(lambda i, p: self._progress_bar(i).setValue(p))
@@ -1570,26 +1575,13 @@ class MainWindow(QMainWindow):
         w.track_note.connect(self._on_track_note)
         w.finished_all.connect(self._on_finished)
         w.finished.connect(self._on_thread_finished)
-        llm.free_llm()  # ASR and notes LLM never share memory
         diagnostics.log_event("transcription started", model=wanted.model,
                               device=wanted.device, language=wanted.language,
                               tracks=len(indices))
         self._set_running(True)
         self._last_summary = ""
-        self._run_started = time.monotonic()
-        self.elapsed_label.setText("0:00")
-        self._elapsed_timer.start()
+        self._run_clock.start()
         w.start()
-
-    @staticmethod
-    def _format_elapsed(seconds: float) -> str:
-        m, s = divmod(int(seconds), 60)
-        h, m = divmod(m, 60)
-        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-    def _tick_elapsed(self) -> None:
-        if self._run_started is not None:
-            self.elapsed_label.setText(self._format_elapsed(time.monotonic() - self._run_started))
 
     def _set_running(self, running: bool) -> None:
         for widget in (self.combo_model, self.combo_lang, self.combo_device,
@@ -1600,16 +1592,13 @@ class MainWindow(QMainWindow):
         self.btn_ai_notes.setEnabled(not running and self.notes_worker is None)
         self.btn_transcribe.setText("Cancel" if running else "Transcribe")
         self.btn_transcribe.setEnabled(True)
-        if not running and self.has_cuda:
-            pass  # device combo re-enabled above; GPU entry stays valid
 
     def _progress_bar(self, row: int) -> QProgressBar:
         return self.table.cellWidget(row, COL_PROGRESS)
 
     def _set_status(self, row: int, text: str) -> None:
-        self.table.blockSignals(True)
-        self.table.item(row, COL_STATUS).setText(text)
-        self.table.blockSignals(False)
+        with QSignalBlocker(self.table):
+            self.table.item(row, COL_STATUS).setText(text)
 
     @Slot(int)
     def _on_track_started(self, i: int) -> None:
@@ -1692,13 +1681,8 @@ class MainWindow(QMainWindow):
                 self._progress_bar(i).setValue(100)
         errors = [t for t in self.tracks if t.status == TrackStatus.ERROR]
         discarded = discarded_segment_count(self.tracks)
-        self._elapsed_timer.stop()
-        took = ""
-        if self._run_started is not None:
-            elapsed = self._format_elapsed(time.monotonic() - self._run_started)
-            self.elapsed_label.setText(f"took {elapsed}")
-            self._run_started = None
-            took = f" — took {elapsed}"
+        elapsed = self._run_clock.stop()
+        took = f" — took {elapsed}" if elapsed else ""
         done = sum(1 for t in self.tracks if t.status == TrackStatus.DONE)
         if cancelled:
             msg = f"Transcription cancelled{took}"
@@ -1708,8 +1692,7 @@ class MainWindow(QMainWindow):
             msg = f"Transcription complete{took} · {done} track(s)"
         if discarded:
             msg += f" · {discarded} partial segment(s) excluded"
-        self._last_summary = msg
-        self.statusBar().showMessage(msg)
+        self._set_summary(msg)
         diagnostics.log_event("transcription finished", cancelled=cancelled,
                               done=done, errors=len(errors), discarded=discarded)
         self._set_running(False)
@@ -1730,31 +1713,51 @@ class MainWindow(QMainWindow):
             self._refresh_timer.start()
 
     def _render_transcript(self) -> None:
-        segments = merge_tracks(self.tracks)
-        if not segments:
-            self.transcript_view.clear()
-            self.notes_transcript_view.clear()
-            return
+        self._refresh_timer.stop()  # this is the refresh a pending one would do
         parts = []
-        for seg in coalesce(segments):
-            ts = _fmt_duration(seg.start)
+        for seg in coalesce(merge_tracks(self.tracks)):
+            ts = exporters.hms(seg.start)
             parts.append(
                 f"<p><b>{html.escape(seg.speaker)}</b> "
                 f"<span style='color:gray'>[{ts}]</span>: "
                 f"{html.escape(seg.text.strip())}</p>"
             )
         html_text = "\n".join(parts)
-        scrollbar = self.transcript_view.verticalScrollBar()
-        at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
-        self.transcript_view.setHtml(html_text)
-        if at_bottom:
+        if html_text == self._transcript_html:
+            return
+        self._transcript_html = html_text
+        self._stale_views = {self.transcript_view, self.notes_transcript_view}
+        self._sync_transcript_views()
+
+    def _sync_transcript_views(self) -> None:
+        """Draw the transcript into the view on screen, if it is behind.
+
+        Only one of the two can be seen at a time, and drawing a long session
+        takes a fifth of a second of the GUI thread, so the other waits until
+        its tab is opened (or the Notes tab's transcript pane is shown).
+        """
+        if self.tabs.currentIndex() == 0:
+            view = self.transcript_view
+        elif self.check_show_transcript.isChecked():
+            view = self.notes_transcript_view
+        else:
+            return
+        if view not in self._stale_views:
+            return
+        self._stale_views.discard(view)
+        if not self._transcript_html:
+            view.clear()
+            return
+        scrollbar = view.verticalScrollBar()
+        position = scrollbar.value()
+        at_bottom = position >= scrollbar.maximum() - 10
+        view.setHtml(self._transcript_html)
+        if view is self.notes_transcript_view:
+            # The notes-side mirror keeps the reader's place instead of
+            # following the bottom.
+            scrollbar.setValue(min(position, scrollbar.maximum()))
+        elif at_bottom:
             scrollbar.setValue(scrollbar.maximum())
-        # The notes-side mirror keeps the reader's place instead of
-        # following the bottom.
-        notes_sb = self.notes_transcript_view.verticalScrollBar()
-        pos = notes_sb.value()
-        self.notes_transcript_view.setHtml(html_text)
-        notes_sb.setValue(min(pos, notes_sb.maximum()))
 
     # ---------- Export ----------
 
@@ -1769,13 +1772,10 @@ class MainWindow(QMainWindow):
         if not surprises:
             return True
         listed = "\n".join(f"  {p.name}" for p in surprises)
-        answer = QMessageBox.question(
-            self, "Replace existing files?",
+        return self._confirm(
+            "Replace existing files?",
             f"These files already exist in {surprises[0].parent} and will be "
-            f"replaced:\n\n{listed}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        return answer == QMessageBox.StandardButton.Yes
+            f"replaced:\n\n{listed}")
 
     def _confirm_incomplete_export(self) -> bool:
         """Warn before exporting when any track isn't fully transcribed.
@@ -1793,19 +1793,15 @@ class MainWindow(QMainWindow):
                            for t, gap in incomplete[:5])
         if len(incomplete) > 5:
             listed += f"\n  • …and {len(incomplete) - 5} more"
-        answer = QMessageBox.warning(
-            self, "Incomplete transcript",
+        return self._confirm(
+            "Incomplete transcript",
             f"{len(incomplete)} track(s) not fully transcribed:\n\n{listed}\n\n"
             "Whatever those speakers said that wasn't transcribed will be "
             "missing from the export. Export anyway?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        return answer == QMessageBox.StandardButton.Yes
+            warning=True)
 
     def export_dialog(self) -> None:
-        segments = merge_tracks(self.tracks)
-        if not segments:
+        if not merge_tracks(self.tracks):
             return
         if not self._confirm_incomplete_export():
             return
@@ -1817,14 +1813,14 @@ class MainWindow(QMainWindow):
             return
         asked_for = Path(path_str)
         path = asked_for
+        # The exporters merge the tracks as they write, after every prompt
+        # here: Align's review can open over these prompts and move offsets.
         try:
             if selected.startswith("All formats"):
                 targets = [path.with_suffix(ext) for ext in exporters.EXPORTERS]
                 if not self._confirm_overwrites(targets, asked_for):
                     return
-                # Merged again: Align's review can open over the prompts above.
-                segments = merge_tracks(self.tracks)
-                written = exporters.export_all(path, segments, self.tracks)
+                written = exporters.export_all(path, self.tracks)
                 self.statusBar().showMessage(
                     "Exported: " + ", ".join(p.name for p in written), 5000)
             else:
@@ -1833,8 +1829,7 @@ class MainWindow(QMainWindow):
                     path = path.with_suffix(ext)
                 if not self._confirm_overwrites([path], asked_for):
                     return
-                segments = merge_tracks(self.tracks)
-                exporters.export(path, segments, self.tracks)
+                exporters.export(path, self.tracks)
                 self.statusBar().showMessage(f"Exported {path}", 5000)
         except exporters.ExportError as exc:
             written = ", ".join(p.name for p in exc.written)
@@ -1853,11 +1848,7 @@ class MainWindow(QMainWindow):
     def _load_settings(self) -> None:
         settings = QSettings()
         self.edit_hints.setPlainText(settings.value("hints", "", str))
-        # A starred model beats the last-used one.
-        model = (settings.value("starred_model", "", str)
-                 or settings.value("model", "", str))
-        if model:
-            self.combo_model.setCurrentText(model)
+        self._restore_model(settings, self.combo_model, "model")
         lang_index = self.combo_lang.findData(settings.value("language", None))
         if lang_index >= 0:
             self.combo_lang.setCurrentIndex(lang_index)
@@ -1865,24 +1856,23 @@ class MainWindow(QMainWindow):
         self._update_language_choices()
         # Loading is not a change: it must not mark the notes unsaved or
         # schedule a rewrite of what was just read.
-        self.notes_edit.blockSignals(True)
-        try:
+        with QSignalBlocker(self.notes_edit):
             self.notes_edit.setPlainText(settings.value("notes", "", str))
-        finally:
-            self.notes_edit.blockSignals(False)
-        notes_model = (settings.value("starred_notes_model", "", str)
-                       or settings.value("notes_model", "", str))
-        if notes_model:
-            self.combo_notes_model.setCurrentText(notes_model)
+        self._restore_model(settings, self.combo_notes_model, "notes_model")
         self.edit_notes_instructions.setPlainText(
             settings.value("notes_instructions", "", str))
         if settings.contains("dark"):
-            self.dark_checkbox.blockSignals(True)
-            self.dark_checkbox.setChecked(settings.value("dark", False, bool))
-            self.dark_checkbox.blockSignals(False)
-            QGuiApplication.styleHints().setColorScheme(
-                Qt.ColorScheme.Dark if self.dark_checkbox.isChecked()
-                else Qt.ColorScheme.Light)
+            dark = settings.value("dark", False, bool)
+            with QSignalBlocker(self.dark_checkbox):
+                self.dark_checkbox.setChecked(dark)
+            self._apply_color_scheme(dark)
+
+    @staticmethod
+    def _restore_model(settings: QSettings, combo: QComboBox, key: str) -> None:
+        """A starred model (see _make_star_button) beats the last-used one."""
+        model = settings.value(f"starred_{key}", "", str) or settings.value(key, "", str)
+        if model:
+            combo.setCurrentText(model)
 
     def _save_settings(self) -> None:
         settings = QSettings()
@@ -1974,25 +1964,20 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Still working")
-        box.setText("A step that cannot be interrupted is still running.")
-        box.setInformativeText(
+        choice = self._choose(
+            "Still working", "A step that cannot be interrupted is still running.",
             "Transcribing a track, a Qwen speech region, and downloading a "
             "model all have to finish before the app can close cleanly.\n\n"
-            "The window closes on its own as soon as that happens.")
-        keep = box.addButton("Wait for it", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("Quit now", QMessageBox.ButtonRole.DestructiveRole)
-        box.setDefaultButton(keep)
-        box.exec()
-        if box.clickedButton() is not keep:
+            "The window closes on its own as soon as that happens.",
+            [("Wait for it", QMessageBox.ButtonRole.AcceptRole, "wait"),
+             ("Quit now", QMessageBox.ButtonRole.DestructiveRole, "quit")],
+            default="wait")
+        if choice != "wait":
             # Nothing can unblock a native call already in flight, and tearing
             # down running QThreads crashes Qt. Leave the process instead —
             # settings are saved above, and the notes are saved now or the
             # user has said what to do with them.
-            if not self._save_notes() and not self._settle_unsaved_notes():
-                self._call_off_close()
+            if not self._notes_ready_to_close():
                 event.ignore()
                 return
             diagnostics.log_event("force quit while workers were running")
@@ -2003,13 +1988,20 @@ class MainWindow(QMainWindow):
     def _close_with_notes_saved(self, event) -> None:
         """Nothing is running: the last notes save, then the close itself."""
         self._notes_save_timer.stop()
-        if not self._save_notes() and not self._settle_unsaved_notes():
-            self._call_off_close()
+        if not self._notes_ready_to_close():
             event.ignore()
             return
         self.stats_poller.stop()
         self.stats_poller.wait(3000)
         event.accept()
+
+    def _notes_ready_to_close(self) -> bool:
+        """The final notes save, or the user's say on notes it could not
+        write; False once the close has been called off."""
+        if self._save_notes() or self._settle_unsaved_notes():
+            return True
+        self._call_off_close()
+        return False
 
     def _settle_unsaved_notes(self) -> bool:
         """The final save failed: True to close once the notes are written
@@ -2031,23 +2023,46 @@ class MainWindow(QMainWindow):
 
     def _ask_about_unsaved_notes(self) -> str:
         """One prompt: "retry", "elsewhere", "return" or "discard"."""
+        return self._choose(
+            "Notes not saved", "Your latest notes could not be saved.",
+            f"{self._notes_save_error}\n\nClosing now would lose them.",
+            [("Retry", QMessageBox.ButtonRole.AcceptRole, "retry"),
+             ("Save Elsewhere…", QMessageBox.ButtonRole.ActionRole, "elsewhere"),
+             ("Return to App", QMessageBox.ButtonRole.RejectRole, "return"),
+             ("Close Without Saving", QMessageBox.ButtonRole.DestructiveRole, "discard")],
+            default="retry", escape="return") or "return"
+
+    # ---------- Prompts ----------
+
+    def _confirm(self, title: str, text: str, warning: bool = False) -> bool:
+        """Ask Yes or Cancel, Cancel the default; True for Yes."""
+        ask = QMessageBox.warning if warning else QMessageBox.question
+        buttons = QMessageBox.StandardButton
+        return ask(self, title, text, buttons.Yes | buttons.Cancel,
+                   buttons.Cancel) == buttons.Yes
+
+    def _choose(self, title: str, text: str, informative: str, choices: list,
+                default: str, escape: str | None = None) -> str | None:
+        """A warning with its own buttons: the key of the one pressed, or None.
+
+        `choices` holds (label, role, key), or (standard button, None, key).
+        `default` and `escape` name buttons by key.
+        """
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Notes not saved")
-        box.setText("Your latest notes could not be saved.")
-        box.setInformativeText(f"{self._notes_save_error}\n\nClosing now would lose them.")
-        retry = box.addButton("Retry", QMessageBox.ButtonRole.AcceptRole)
-        elsewhere = box.addButton("Save Elsewhere…", QMessageBox.ButtonRole.ActionRole)
-        back = box.addButton("Return to App", QMessageBox.ButtonRole.RejectRole)
-        discard = box.addButton("Close Without Saving", QMessageBox.ButtonRole.DestructiveRole)
-        choices = [(retry, "retry"), (elsewhere, "elsewhere"), (back, "return"),
-                   (discard, "discard")]
-        box.setDefaultButton(retry)
-        box.setEscapeButton(back)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setInformativeText(informative)
+        buttons = [(box.addButton(label) if role is None else box.addButton(label, role), key)
+                   for label, role, key in choices]
+        keyed = {key: button for button, key in buttons}
+        box.setDefaultButton(keyed[default])
+        if escape is not None:
+            box.setEscapeButton(keyed[escape])
         box.exec()
         clicked = box.clickedButton()
         box.deleteLater()
-        return next((choice for button, choice in choices if button is clicked), "return")
+        return next((key for button, key in buttons if button is clicked), None)
 
     def _call_off_close(self) -> None:
         """Back to the app with the notes still in the editor. Any job told to

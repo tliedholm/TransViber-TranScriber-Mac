@@ -61,7 +61,9 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   change, typed or streamed, and cleared only by a save that succeeded, so
   untouched notes are never rewritten and a failed save is never forgotten.
   `IS_MAC` switches the Device combo to "GPU (Metal)" (`"mlx"`) / CPU.
-  Settings (model, language, vocab hints) persist via QSettings.
+  Settings (model, language, vocab hints) persist via QSettings. The live
+  transcript is drawn only into the view on screen (`_sync_transcript_views`);
+  the other tab's copy waits until it is shown.
 - `diagnostics.py` — rotating log at
   `~/Library/Logs/TransViber TransScriber/transviber.log`. Every engine
   failure lands there with traceback, model, requested device, backend
@@ -94,7 +96,17 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   `fallback_backend()` offers a retry only where a real alternative exists
   (mlx-whisper -> faster-whisper CPU; CUDA -> CPU). Qwen (MLX-only) and
   onnx on a Mac (already the CPU EP) get none — the worker reports the
-  failure rather than "retrying on CPU" onto the same runtime.
+  failure rather than "retrying on CPU" onto the same runtime. The retry
+  runs after the `except` block, so the failed attempt's frames (its model
+  and the track's audio) are not pinned under it.
+  `_transcribe_track` is the one driver: it starts, decodes, checks for a
+  stop and finishes every track, and each `_transcribe_<engine>` method only
+  turns the audio into segments, returning the language (None: cancelled).
+  `free_asr_models()` also drops what the libraries cache themselves
+  (mlx-whisper's `ModelHolder`, the Qwen forced aligner in
+  `mlx_qwen3_asr.load_models._ModelHolder`); `_get_model` calls it before
+  loading a different model, and `TranscribeWorker.run` frees the notes
+  LLM as `NotesWorker.run` frees the ASR models.
   The backend that ran is recorded per track in `Track.config` (a
   `RunConfig`) and exported in the JSON, because a transcript assembled over
   several runs can legitimately mix models.
@@ -103,6 +115,8 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   and aggregates byte-unit bars while a worker run is active. It also
   forces huggingface_hub bars on (they self-disable without a TTY, losing
   the byte counts) and swaps faster-whisper's disabled_tqdm for a live one.
+  It is installed by the first `begin_download_reporting()`, not at import,
+  so the window opens without importing faster-whisper.
 - `llm.py` — `NotesWorker` streams local Markdown notes through mlx-lm.
   Long transcripts are summarized in parts and combined; ASR and notes
   model caches are mutually exclusive to protect unified memory.
@@ -110,7 +124,8 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   (`context_window()` reads `model.args.max_position_embeddings` — 40,960
   for Qwen3 — then `model.language_model.args`, where multimodal
   checkpoints such as Qwen3.5 and Gemma 4 keep it, and never trusts
-  `tokenizer.model_max_length` alone), capped by `pass_limit()`
+  `tokenizer.model_max_length` alone), capped by `pass_limit()` (both in
+  `pass_context()`, which the self-test shares)
   (`MAX_PASS_TOKENS`, 65,536; 32,768 for gpt-oss), minus the whole request
   and `MAX_NOTES_TOKENS` of output. The cap is for memory, not the model:
   the whole prompt's KV cache sits in unified memory, and a 16 GB Mac gives
@@ -168,7 +183,8 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   It is a copy of the PC edition's module (only the module note differs);
   keep it that way so fixes port both ways.
 - `merger.py` / `exporters.py` — chronological merge (each track's offset
-  added to copies of its segments), same-speaker coalescing, and
+  added to, and its current name stamped on, copies of its segments, so a
+  rename never rewrites segments), same-speaker coalescing, and
   md/txt/srt/vtt/json exporters; the JSON records each track's `offset` and
   `offset_source`. `merge_tracks()` skips `ERROR` tracks: an engine can
   emit segments and *then* raise, and those
@@ -191,8 +207,9 @@ to stay compatible with Windows, but the user may ask to port fixes across.
 - **Word-gap splitting**: Whisper merges utterances separated by silence
   into one segment, which destroys the chronological interleaving. Both
   Whisper paths must split segments at word gaps > `SPLIT_GAP_SECONDS` (1 s)
-  using word timestamps (`split_on_word_gaps` for faster-whisper; inline
-  dict-based splitting in `_transcribe_track_mlx`).
+  using word timestamps. Every engine with word timestamps (both Whisper
+  paths and Qwen) goes through `split_timed_words`; `split_on_word_gaps`
+  feeds it faster-whisper's segments.
 - **Hallucination guards**: faster-whisper uses `vad_filter=True`; the MLX
   path has no VAD so it drops segments with `no_speech_prob > 0.6`. Sparse
   speaker tracks are mostly silence — removing these guards produces
@@ -269,9 +286,10 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   Never hand mlx-whisper a file path — its loader shells out to an `ffmpeg`
   binary that is not installed here and is absent from the shipped `.app`;
   the failure is masked by the worker's silent CPU fallback.
-- `main.py` must call `multiprocessing.freeze_support()` first. In the frozen
-  `.app` a multiprocessing child re-executes the same binary, so without it
-  a child launches a second copy of the GUI.
+- `main.py` must call `multiprocessing.freeze_support()` first, and import
+  the GUI only after it. In the frozen `.app` a multiprocessing child
+  re-executes the same binary, so without it a child launches a second copy
+  of the GUI.
 - Vocabulary hints: faster-whisper uses `hotwords=`, MLX uses
   `initial_prompt=`, Qwen uses `context=`; the field is hidden for onnx
   models (no support).
@@ -310,7 +328,8 @@ and no GPU: it only reads the files.
 - **Reuse.** Decoding is most of Align's time, so the window keeps each
   fingerprint from the last run, keyed by path and streams and stamped with
   the file's modified time and size; an unchanged file is not decoded
-  again. Only files loaded when Align is pressed keep theirs. Within one
+  again. Only files still loaded keep theirs: removing a file, replacing
+  or removing the reference, or Clear lets go of its fingerprint. Within one
   `find_offset`, `_Transforms` works out the reference's FFT once per size.
 - **Trust.** The label comes from peak ÷ best score more than 0.5 s away:
   strong ≥ `MATCH_RATIO` (ticked), weak ≥ `WEAK_RATIO` (unticked), else no
@@ -356,8 +375,8 @@ and no GPU: it only reads the files.
   and the reference controls from Align until the review closes. Offset
   edits, Transcribe and AI Notes stay available during Align. The review
   waits for any other modal prompt to close first, commits an Offset still
-  being typed before reading "Now", and Export merges again right before
-  each write. A quit stops a running Align (it checks between decoded
+  being typed before reading "Now", and the exporters merge the tracks
+  as they write, after every prompt. A quit stops a running Align (it checks between decoded
   chunks and between matches) and never opens the review.
 - **Calibration status.** The thresholds are provisional. On synthetic
   energy sessions true matches scored about 3.3–24 and 1,200 unrelated

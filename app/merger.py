@@ -2,28 +2,24 @@
 
 from __future__ import annotations
 
-from models import Segment, Track, TrackStatus
+from models import Segment, Track
 
 
-def merge_tracks(tracks: list[Track], include_failed: bool = False) -> list[Segment]:
+def merge_tracks(tracks: list[Track]) -> list[Segment]:
     """All segments from all usable tracks, on the session clock, ordered by start time.
 
     Segment times inside a track are relative to its own file; each track's
     offset is added here, to copies, so the tracks keep their raw times and
     the offset can never be applied twice — however often this runs or the
-    offset changes. What this returns is a view: editing it changes no
-    track. Python's sort is stable, so exact ties keep track order.
-
-    An engine can emit segments and *then* raise: those partial segments are
-    a fragment of one speaker's audio, and letting them into the merged
-    conversation makes an incomplete transcript look finished. They stay on
-    the Track (nothing is thrown away silently, and the UI reports how many)
-    but are kept out of the transcript and every export unless asked for.
+    offset changes. The speaker is the track's name now, stamped here the
+    same way, so a rename never has to rewrite segments. What this returns is
+    a view: editing it changes no track. Python's sort is stable, so exact
+    ties keep track order. A failed track is left out (Track.in_transcript).
     """
     segments = [
-        Segment(seg.speaker, seg.start + track.offset, seg.end + track.offset, seg.text)
+        Segment(track.speaker, seg.start + track.offset, seg.end + track.offset, seg.text)
         for track in tracks
-        if include_failed or track.status != TrackStatus.ERROR
+        if track.in_transcript
         for seg in track.segments
     ]
     segments.sort(key=lambda s: (s.start, s.end))
@@ -32,7 +28,7 @@ def merge_tracks(tracks: list[Track], include_failed: bool = False) -> list[Segm
 
 def discarded_segment_count(tracks: list[Track]) -> int:
     """How many segments merge_tracks is holding back from failed tracks."""
-    return sum(len(t.segments) for t in tracks if t.status == TrackStatus.ERROR)
+    return sum(len(t.segments) for t in tracks if not t.in_transcript)
 
 
 def coalesce(segments: list[Segment]) -> list[Segment]:
@@ -42,11 +38,17 @@ def coalesce(segments: list[Segment]) -> list[Segment]:
     original fine-grained segments for accurate subtitle timing.
     """
     blocks: list[Segment] = []
+    texts: list[list[str]] = []
     for seg in segments:
         if blocks and blocks[-1].speaker == seg.speaker:
-            prev = blocks[-1]
-            prev.text = (prev.text.rstrip() + " " + seg.text.strip()).strip()
-            prev.end = max(prev.end, seg.end)
+            blocks[-1].end = max(blocks[-1].end, seg.end)
+            texts[-1].append(seg.text.strip())
         else:
-            blocks.append(Segment(seg.speaker, seg.start, seg.end, seg.text.strip()))
+            blocks.append(Segment(seg.speaker, seg.start, seg.end, ""))
+            texts.append([seg.text.strip()])
+    # Joined once per block: adding to a block's text segment by segment
+    # copied the whole block each time, which the live view paid on every
+    # refresh of a long monologue.
+    for block, parts in zip(blocks, texts):
+        block.text = " ".join(part for part in parts if part)
     return blocks

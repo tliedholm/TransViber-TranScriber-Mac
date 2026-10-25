@@ -69,9 +69,8 @@ def test_config_differences_are_named():
 def test_subtrack_labelling():
     track = Track(path=Path("/tmp/craig.flac"), speaker="Alice",
                   stream_index=2, channel=0)
-    assert track.is_subtrack
     assert track.source_label == "craig.flac [track 3, ch 1]"
-    assert not Track(path=Path("/tmp/a.wav"), speaker="A").is_subtrack
+    assert Track(path=Path("/tmp/a.wav"), speaker="A").source_label == "a.wav"
 
 
 def test_a_decode_note_travels_with_its_transcript():

@@ -388,8 +388,7 @@ def test_the_reference_never_reaches_transcription(s):
     w = s.w
     w.set_session_reference(s.file("session.wav"))
     w.add_files([s.file("bob.wav")])
-    with patch("main_window.TranscribeWorker") as worker_class, \
-            patch("main_window.llm.free_llm"):
+    with patch("main_window.TranscribeWorker") as worker_class:
         w.toggle_transcription()
     tracks, indices = worker_class.call_args.args
     assert [t.path.name for t in tracks] == ["bob.wav"]
@@ -737,7 +736,6 @@ def test_transcription_started_during_alignment_keeps_the_list_locked(s, monkeyp
     w.add_files([alice, bob])
     worker_class = Mock()
     monkeypatch.setattr(main_window, "TranscribeWorker", worker_class)
-    monkeypatch.setattr(main_window.llm, "free_llm", lambda: None)
     result = AlignmentResult([Suggestion(alice, 0.0, "matched", "m", "strong"),
                               Suggestion(bob, 4.0, "matched", "m", "strong")],
                              SESSION_REFERENCE, w.session_reference.path)

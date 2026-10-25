@@ -161,7 +161,7 @@ try:
     name = llm.DEFAULT_NOTES_MODEL
     model, tok = load(llm.LLM_REPOS[name])
     notes_ok = model is not None and tok is not None
-    context = min(llm.context_window(model, tok), llm.pass_limit(name))
+    context = llm.pass_context(model, tok, name)
     # Sizes every pass through the real chat template, as a notes run does.
     room = min(llm.NotesWorker("", "", name)._budgets(tok, context))
     print(f"loaded {name} OK (context {context}, {room:,} tokens of "

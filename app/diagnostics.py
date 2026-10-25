@@ -37,7 +37,7 @@ def log_path() -> Path:
 
 
 def _package_versions() -> str:
-    from importlib.metadata import PackageNotFoundError, version
+    from importlib.metadata import version
 
     names = ("faster-whisper", "ctranslate2", "mlx", "mlx-whisper", "mlx-lm",
              "mlx-qwen3-asr", "onnx-asr", "onnxruntime", "av", "transformers",
@@ -46,9 +46,7 @@ def _package_versions() -> str:
     for name in names:
         try:
             found.append(f"{name}={version(name)}")
-        except PackageNotFoundError:
-            continue
-        except Exception:  # a broken dist-info must not break logging
+        except Exception:  # not installed, or a broken dist-info: never break logging
             continue
     return " ".join(found)
 
@@ -66,10 +64,9 @@ def get_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.propagate = False
     try:
-        directory = log_dir()
-        directory.mkdir(parents=True, exist_ok=True)
+        log_dir().mkdir(parents=True, exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
-            directory / LOG_NAME, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT,
+            log_path(), maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT,
             encoding="utf-8")
         handler.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))

@@ -5,12 +5,14 @@ separated by silence into one segment, which would sort a speaker's later
 remark at the time of their earlier one and destroy the interleaving.
 """
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import audio
 import transcriber
-from transcriber import SPLIT_GAP_SECONDS, split_on_word_gaps
+from transcriber import SPLIT_GAP_SECONDS, split_on_word_gaps, split_timed_words
 
 
 @dataclass
@@ -66,6 +68,29 @@ def test_pieces_are_chronological():
     seg = FwSegment(0.0, 60.0, "", [Word(0, 1, "a"), Word(20, 21, "b"), Word(50, 51, "c")])
     pieces = split_on_word_gaps(seg, "Alice")
     assert [p.start for p in pieces] == sorted(p.start for p in pieces)
+
+
+def test_qwen_words_split_the_same_way_back_on_the_region_offset():
+    # Qwen's words are bare (no leading space) and timed from their region.
+    words = [(0.0, 0.4, "one"), (0.5, 0.9, "two"), (5.0, 5.4, "three")]
+    pieces = split_timed_words(words, "Alice", sep=" ", offset=100.0)
+    assert [(p.start, p.end, p.text) for p in pieces] == [
+        (100.0, 100.9, "one two"), (105.0, 105.4, "three")]
+
+
+def test_free_asr_models_also_drops_the_engines_own_caches(monkeypatch):
+    # mlx-whisper's model and Qwen's forced aligner are cached by the
+    # libraries themselves, where the app's own cache never sees them.
+    whisper = SimpleNamespace(model=object(), model_path="mlx-community/whisper-large-v3-mlx")
+    monkeypatch.setitem(sys.modules, "mlx_whisper.transcribe",
+                        SimpleNamespace(ModelHolder=whisper))
+    aligner = {"Qwen/Qwen3-ForcedAligner-0.6B": object()}
+    qwen = SimpleNamespace(clear=aligner.clear)
+    monkeypatch.setitem(sys.modules, "mlx_qwen3_asr.load_models",
+                        SimpleNamespace(_ModelHolder=qwen))
+    transcriber.free_asr_models()
+    assert (whisper.model, whisper.model_path) == (None, None)
+    assert aligner == {}
 
 
 # ---- multitrack expansion --------------------------------------------------

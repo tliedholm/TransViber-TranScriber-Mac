@@ -47,18 +47,6 @@ OPTIONAL_PACKAGES = (
 )
 
 HIDDEN_IMPORTS = [
-    # Flat modules in app/ that are only reached through main.py.
-    "cuda_setup",
-    "main_window",
-    "transcriber",
-    "llm",
-    "stats",
-    "audio",
-    "align",
-    "merger",
-    "exporters",
-    "models",
-    "diagnostics",
     # Imported lazily inside functions, so static analysis misses them.
     "mlx.core",
     "mlx.nn",
@@ -168,4 +156,7 @@ def collect(app_dir: Path) -> tuple[list, list, list]:
             "Hugging Face's certificate and no model would ever download.")
     datas += certifi_data
 
-    return datas, binaries, hiddenimports + HIDDEN_IMPORTS
+    # The app's own flat modules, which are only reached through main.py:
+    # read from the folder, so a new one can't be left out of the bundle.
+    app_modules = sorted(p.stem for p in app_dir.glob("*.py") if p.stem != "main")
+    return datas, binaries, hiddenimports + app_modules + HIDDEN_IMPORTS

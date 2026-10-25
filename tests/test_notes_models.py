@@ -182,9 +182,6 @@ def fake_mlx_lm(monkeypatch):
 
 def one_pass(model_name):
     worker = llm.NotesWorker("", "", model_name)
-    worker._tokens = worker._pass_base = worker._passes_done = 0
-    worker._passes_total = 1
-    worker._last_tps = 0.0
     chunks = []
     worker.chunk.connect(chunks.append)
     return worker, chunks

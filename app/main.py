@@ -5,21 +5,8 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication
 
-from main_window import MainWindow
-from models import AUDIO_EXTENSIONS
-
-
-def audio_paths(candidates) -> list[Path]:
-    """Keep the arguments that are audio files this app can open."""
-    paths = []
-    for candidate in candidates:
-        path = Path(candidate)
-        if path.suffix.lower() in AUDIO_EXTENSIONS and path.is_file():
-            paths.append(path)
-    return paths
+from models import audio_paths
 
 
 class FileOpenFilter(QObject):
@@ -31,15 +18,14 @@ class FileOpenFilter(QObject):
     opened through them.
     """
 
-    def __init__(self, window: MainWindow):
+    def __init__(self, window):
         super().__init__(window)
         self.window = window
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.FileOpen:
-            paths = audio_paths([event.file()] if event.file() else [])
-            if not paths and not event.url().isEmpty():
-                paths = audio_paths([event.url().toLocalFile()])
+            # add_files skips anything that isn't a file.
+            paths = audio_paths([event.file()]) or audio_paths([event.url().toLocalFile()])
             if paths:
                 self.window.add_files(paths)
                 self.window.raise_()
@@ -53,6 +39,13 @@ def main() -> int:
     # a multiprocessing child re-executes this same binary, so without this
     # the child starts a second copy of the whole GUI instead of the worker.
     multiprocessing.freeze_support()
+    # The rest of the app only after it: a child that re-executes this
+    # binary stops at freeze_support(), and has no use for the GUI's imports.
+    from PySide6.QtGui import QIcon
+    from PySide6.QtWidgets import QApplication
+
+    from main_window import MainWindow
+
     app = QApplication(sys.argv)
     app.setApplicationName("TransViber TransScriber")
     app.setOrganizationName("TransViber")
@@ -62,7 +55,7 @@ def main() -> int:
     window = MainWindow()
     # Files opened before the window existed: argv_emulation in the spec turns
     # a Finder "Open With" at launch into ordinary arguments.
-    startup_files = audio_paths(app.arguments()[1:])
+    startup_files = [path for path in audio_paths(app.arguments()[1:]) if path.is_file()]
     file_filter = FileOpenFilter(window)
     app.installEventFilter(file_filter)
     window.show()
