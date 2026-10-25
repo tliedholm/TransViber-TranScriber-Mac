@@ -33,8 +33,15 @@ def test_failed_tracks_are_left_out_of_the_merge():
     bad = track("Bob", [(0.5, 1.5, "partial")], status=TrackStatus.ERROR)
     assert [s.text for s in merge_tracks([good, bad])] == ["kept"]
     assert discarded_segment_count([good, bad]) == 1
-    # The segments are still there when explicitly asked for.
-    assert len(merge_tracks([good, bad], include_failed=True)) == 2
+    # The segments are still on the track, never thrown away silently.
+    assert [s.text for s in bad.segments] == ["partial"]
+
+
+def test_the_merge_names_each_segment_after_its_track_as_it_is_now():
+    # A rename only changes the track: the merge stamps the current name.
+    alice = track("Alice", [(0.0, 1.0, "hi")])
+    alice.speaker = "Zephyrine"
+    assert [s.speaker for s in merge_tracks([alice])] == ["Zephyrine"]
 
 
 def test_cancelled_tracks_keep_their_partial_output():
@@ -111,6 +118,12 @@ def test_coalesce_joins_consecutive_same_speaker():
     assert blocks[0].end == 2
 
 
+def test_coalesce_drops_blank_text_and_edge_spaces():
+    segments = [Segment("Alice", 0, 1, "  "), Segment("Alice", 1, 2, " one "),
+                Segment("Alice", 2, 3, ""), Segment("Alice", 3, 4, "two  ")]
+    assert [b.text for b in coalesce(segments)] == ["one two"]
+
+
 def test_coalesce_does_not_mutate_its_input():
     segments = [Segment("Alice", 0, 1, "one"), Segment("Alice", 1, 2, "two")]
     coalesce(segments)
@@ -179,7 +192,7 @@ def test_json_says_what_decoding_ran_into():
 
 def test_export_all_writes_every_format(tmp_path):
     a = track("Alice", [(0, 1, "hello")])
-    written = exporters.export_all(tmp_path / "out.md", merge_tracks([a]), [a])
+    written = exporters.export_all(tmp_path / "out.md", [a])
     assert sorted(p.suffix for p in written) == [".json", ".md", ".srt", ".txt", ".vtt"]
     for path in written:
         assert path.read_text(encoding="utf-8").strip()
@@ -187,7 +200,7 @@ def test_export_all_writes_every_format(tmp_path):
 
 def test_export_rejects_an_unknown_extension(tmp_path):
     with pytest.raises(ValueError):
-        exporters.export(tmp_path / "out.doc", [], [])
+        exporters.export(tmp_path / "out.doc", [])
 
 
 # ---------- Each file replaced whole, and a failure says how far it got ----------
@@ -237,7 +250,7 @@ def test_a_full_disk_while_staging_changes_nothing(old_exports, monkeypatch):
     full = OSError(28, "No space left on device")
     monkeypatch.setattr(exporters.os, "fsync", failing_on(3, os.fsync, full))
     with pytest.raises(exporters.ExportError) as caught:
-        exporters.export_all(base, SEGMENTS, TRACKS)
+        exporters.export_all(base, TRACKS)
     assert untouched(targets)
     assert no_staged_files_left(targets)
     error = caught.value
@@ -252,7 +265,7 @@ def test_a_failed_first_replacement_reports_nothing_written(old_exports, monkeyp
     base, targets = old_exports
     monkeypatch.setattr(exporters.os, "replace", failing_on(1, os.replace))
     with pytest.raises(exporters.ExportError) as caught:
-        exporters.export_all(base, SEGMENTS, TRACKS)
+        exporters.export_all(base, TRACKS)
     assert untouched(targets)
     assert no_staged_files_left(targets)
     assert caught.value.written == []
@@ -264,7 +277,7 @@ def test_a_failed_second_replacement_names_what_is_new_and_what_is_old(
     base, targets = old_exports
     monkeypatch.setattr(exporters.os, "replace", failing_on(2, os.replace))
     with pytest.raises(exporters.ExportError) as caught:
-        exporters.export_all(base, SEGMENTS, TRACKS)
+        exporters.export_all(base, TRACKS)
     error = caught.value
     md, txt = targets[:2]
     assert error.written == [md]
@@ -291,7 +304,7 @@ def test_a_cleanup_failure_never_hides_the_real_error(old_exports, monkeypatch):
         raise OSError("busy")
     monkeypatch.setattr(exporters.Path, "unlink", unlink)
     with pytest.raises(exporters.ExportError) as caught:
-        exporters.export_all(base, SEGMENTS, TRACKS)
+        exporters.export_all(base, TRACKS)
     assert "Permission denied" in str(caught.value)
     assert "busy" not in str(caught.value)
     assert untouched(targets)
@@ -302,7 +315,7 @@ def test_a_failed_single_format_export_keeps_the_old_file(old_exports, monkeypat
     srt = base.with_suffix(".srt")
     monkeypatch.setattr(exporters.os, "replace", failing_on(1, os.replace))
     with pytest.raises(exporters.ExportError) as caught:
-        exporters.export(srt, SEGMENTS, TRACKS)
+        exporters.export(srt, TRACKS)
     assert srt.read_text(encoding="utf-8") == "old .srt"
     assert no_staged_files_left(targets)
     assert (str(caught.value).splitlines()[0]
@@ -311,7 +324,7 @@ def test_a_failed_single_format_export_keeps_the_old_file(old_exports, monkeypat
 
 def test_a_successful_export_replaces_every_file_whole(old_exports):
     base, targets = old_exports
-    assert exporters.export_all(base, SEGMENTS, TRACKS) == targets
+    assert exporters.export_all(base, TRACKS) == targets
     assert contents(targets)["session.vtt"] == exporters.to_vtt(SEGMENTS)
     assert no_staged_files_left(targets)
 

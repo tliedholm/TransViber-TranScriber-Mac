@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-import gc
 
 from PySide6.QtCore import QThread, Signal
 
@@ -183,16 +182,10 @@ _llm_cache: dict = {"key": None, "model": None, "tokenizer": None}
 
 def free_llm() -> None:
     """Drop the cached notes LLM so ASR models can have the memory."""
-    _llm_cache["key"] = None
-    _llm_cache["model"] = None
-    _llm_cache["tokenizer"] = None
-    gc.collect()
-    try:
-        import mlx.core as mx
+    from transcriber import release_unified_memory
 
-        mx.clear_cache()
-    except ImportError:
-        pass
+    _llm_cache.update(key=None, model=None, tokenizer=None)
+    release_unified_memory()
 
 
 def _get_llm(model_name: str, status_cb):
@@ -212,22 +205,20 @@ def _family(model_name: str) -> str:
     return model_name.lower().replace("gemma4", "gemma-4")
 
 
+def _for_family(table, model_name: str, default):
+    """The value of the first (family, value) row whose family is in the name."""
+    name = _family(model_name)
+    return next((value for family, value in table if family in name), default)
+
+
 def sampling(model_name: str) -> dict:
     """make_sampler() settings plus an optional presence_penalty (SAMPLING)."""
-    name = _family(model_name)
-    for family, settings in SAMPLING:
-        if family in name:
-            return dict(settings)
-    return {}
+    return dict(_for_family(SAMPLING, model_name, {}))
 
 
 def pass_limit(model_name: str) -> int:
     """The most one pass of this model may hold (MAX_PASS_TOKENS, PASS_LIMITS)."""
-    name = _family(model_name)
-    for family, limit in PASS_LIMITS:
-        if family in name:
-            return limit
-    return MAX_PASS_TOKENS
+    return _for_family(PASS_LIMITS, model_name, MAX_PASS_TOKENS)
 
 
 class ReasoningFilter:
@@ -347,6 +338,11 @@ def context_window(model, tokenizer) -> int:
     return DEFAULT_CONTEXT_TOKENS
 
 
+def pass_context(model, tokenizer, model_name: str) -> int:
+    """The window one pass is sized for: the model's own, cut to pass_limit()."""
+    return min(context_window(model, tokenizer), pass_limit(model_name))
+
+
 def input_budget(tokenizer, model_name: str, context: int, system_text: str) -> int:
     """How many tokens of content one pass with this system text can take.
 
@@ -362,38 +358,47 @@ def input_budget(tokenizer, model_name: str, context: int, system_text: str) -> 
     return prompt_limit(context) - PROMPT_MARGIN_TOKENS - overhead
 
 
-def _line_pieces(line: str, tokenizer, limit: int) -> list[str]:
-    """A line, subdivided at token boundaries if it is too big on its own.
+def _line_pieces(line: str, tokenizer, limit: int) -> list[tuple[str, int]]:
+    """A line, subdivided at token boundaries if it is too big on its own,
+    as (text, tokens) pairs.
 
     coalesce() joins consecutive same-speaker segments into one line, so a
     monologue or a single-speaker recording can produce one line longer than
     the whole context window. Splitting only at line boundaries left such a
-    line whole and blew the budget.
+    line whole and blew the budget. A cut piece is counted again: decoding
+    and re-encoding tokens need not give the same count back.
     """
     ids = tokenizer.encode(line)
     if len(ids) <= limit:
-        return [line]
-    return [tokenizer.decode(ids[i:i + limit]) for i in range(0, len(ids), limit)]
+        return [(line, len(ids))]
+    pieces = [tokenizer.decode(ids[i:i + limit]) for i in range(0, len(ids), limit)]
+    return [(piece, len(tokenizer.encode(piece))) for piece in pieces]
+
+
+def _pack(counted, limit: int, join_cost: int = 0) -> list[list[str]]:
+    """Consecutive (text, tokens) items, grouped greedily into groups of at
+    most `limit` tokens, `join_cost` counted between two items."""
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_tokens = 0
+    for item, n in counted:
+        if current and current_tokens + join_cost + n > limit:
+            groups.append(current)
+            current, current_tokens = [], 0
+        current.append(item)
+        current_tokens += n + (join_cost if current_tokens else 0)
+    if current:
+        groups.append(current)
+    return groups
 
 
 def split_text(text: str, tokenizer, limit: int) -> list[str]:
     """Split text into parts of at most `limit` tokens, preferring line breaks."""
     if len(tokenizer.encode(text)) <= limit:
         return [text]
-    parts: list[str] = []
-    current: list[str] = []
-    current_tokens = 0
-    for line in text.splitlines(keepends=True):
-        for piece in _line_pieces(line, tokenizer, limit):
-            n = len(tokenizer.encode(piece))
-            if current and current_tokens + n > limit:
-                parts.append("".join(current))
-                current, current_tokens = [], 0
-            current.append(piece)
-            current_tokens += n
-    if current:
-        parts.append("".join(current))
-    return parts
+    pieces = (piece for line in text.splitlines(keepends=True)
+              for piece in _line_pieces(line, tokenizer, limit))
+    return ["".join(part) for part in _pack(pieces, limit)]
 
 
 def batch_by_tokens(chunks: list[str], tokenizer, limit: int, joiner: str) -> list[list[str]]:
@@ -403,20 +408,8 @@ def batch_by_tokens(chunks: list[str], tokenizer, limit: int, joiner: str) -> li
     prompt with no ceiling: enough parts at MAX_NOTES_TOKENS each overflowed
     the window on exactly the long sessions that needed chunking.
     """
-    join_cost = len(tokenizer.encode(joiner))
-    batches: list[list[str]] = []
-    current: list[str] = []
-    current_tokens = 0
-    for chunk in chunks:
-        n = len(tokenizer.encode(chunk))
-        if current and current_tokens + join_cost + n > limit:
-            batches.append(current)
-            current, current_tokens = [], 0
-        current.append(chunk)
-        current_tokens += n + (join_cost if current_tokens else 0)
-    if current:
-        batches.append(current)
-    return batches
+    return _pack(((chunk, len(tokenizer.encode(chunk))) for chunk in chunks),
+                 limit, len(tokenizer.encode(joiner)))
 
 
 class NotesWorker(QThread):
@@ -434,6 +427,11 @@ class NotesWorker(QThread):
         self.instructions = instructions.strip()
         self.model_name = model_name.strip() or DEFAULT_NOTES_MODEL
         self._stop = False
+        # Progress over the whole run: tokens so far, passes, last speed.
+        self._tokens = 0
+        self._passes_done = 0
+        self._passes_total = 1
+        self._last_tps = 0.0
 
     def stop(self) -> None:
         self._stop = True
@@ -482,35 +480,35 @@ class NotesWorker(QThread):
         penalty = settings.pop("presence_penalty", None)
         visible = ReasoningFilter()
         pieces = []
+
+        def keep(text: str) -> None:
+            if text:
+                pieces.append(text)
+                if stream:
+                    self.chunk.emit(text)
+
+        pass_tokens = 0
         for response in stream_generate(
                 model, tokenizer, prompt, max_tokens=MAX_NOTES_TOKENS,
                 sampler=make_sampler(**settings),
                 logits_processors=make_logits_processors(presence_penalty=penalty)):
             if self._stop:
                 break
-            text = visible.feed(response.text)
-            if text:
-                pieces.append(text)
-                if stream:
-                    self.chunk.emit(text)
+            keep(visible.feed(response.text))
+            pass_tokens += 1
             self._tokens += 1
             # mlx-lm reports decode speed itself; excludes prompt processing.
             self._last_tps = response.generation_tps
-            frac = min(self._tokens - self._pass_base, MAX_NOTES_TOKENS) / MAX_NOTES_TOKENS
+            frac = min(pass_tokens, MAX_NOTES_TOKENS) / MAX_NOTES_TOKENS
             percent = int((self._passes_done + min(frac, 0.99)) / self._passes_total * 100)
             self.progress.emit(min(percent, 99), self._tokens, self._last_tps)
-        rest = visible.finish()
-        if rest:
-            pieces.append(rest)
-            if stream:
-                self.chunk.emit(rest)
+        keep(visible.finish())
         if visible.unfinished and not self._stop:
             raise RuntimeError(
                 f"The notes model stopped before it finished reasoning, so it "
                 f"wrote no notes (a pass may write {MAX_NOTES_TOKENS:,} tokens, "
                 f"reasoning included). Try again, or choose another notes model.")
         self._passes_done += 1
-        self._pass_base = self._tokens
         return "".join(pieces)
 
     JOINER = "\n\n---\n\n"
@@ -535,15 +533,8 @@ class NotesWorker(QThread):
                 return
             notes = [piece for note in notes
                      for piece in split_text(note, tokenizer, piece_limit)]
-            batches = batch_by_tokens(notes, tokenizer, final_budget, self.JOINER)
-            if len(batches) == 1:
-                self.status.emit("Combining notes…")
-                self._generate(model, tokenizer,
-                               _request(tokenizer, self.model_name,
-                                        self._system_text(COMBINE_PROMPT),
-                                        self.JOINER.join(batches[0])),
-                               stream=True)
-                return
+            if len(batch_by_tokens(notes, tokenizer, final_budget, self.JOINER)) == 1:
+                break
             level += 1
             batches = batch_by_tokens(notes, tokenizer, merge_budget, self.JOINER)
             # Each extra level is passes the initial estimate did not know about.
@@ -559,31 +550,33 @@ class NotesWorker(QThread):
                     _request(tokenizer, self.model_name, MERGE_PROMPT,
                              self.JOINER.join(batch)),
                     stream=False))
-            if len(merged) >= len(notes):
+            stalled = len(merged) >= len(notes)
+            notes = merged
+            if stalled:
                 # No progress (one oversized note per batch): stop reducing and
                 # let the final pass run on what there is rather than loop.
-                notes = merged
-                self.status.emit("Combining notes…")
-                self._generate(model, tokenizer,
-                               _request(tokenizer, self.model_name,
-                                        self._system_text(COMBINE_PROMPT),
-                                        self.JOINER.join(notes)),
-                               stream=True)
-                return
-            notes = merged
+                break
+        self.status.emit("Combining notes…")
+        self._generate(model, tokenizer,
+                       _request(tokenizer, self.model_name,
+                                self._system_text(COMBINE_PROMPT),
+                                self.JOINER.join(notes)),
+                       stream=True)
 
     def run(self) -> None:
-        from transcriber import begin_download_reporting, end_download_reporting
+        from transcriber import (
+            begin_download_reporting,
+            end_download_reporting,
+            free_asr_models,
+        )
 
         begin_download_reporting(self.download_progress.emit)
         try:
             # The ASR model and the notes LLM must never coexist in memory.
-            from transcriber import free_asr_models
-
             free_asr_models()
             model, tokenizer = _get_llm(self.model_name, self.status.emit)
 
-            context = min(context_window(model, tokenizer), pass_limit(self.model_name))
+            context = pass_context(model, tokenizer, self.model_name)
             # Before the header, so instructions that can't fit fail the run
             # with nothing written to the notes.
             _, part_budget, final_budget, merge_budget = self._budgets(tokenizer, context)
@@ -599,10 +592,6 @@ class NotesWorker(QThread):
                 parts = [self.transcript]  # one pass, full prompt, tail sections and all
             else:
                 parts = split_text(self.transcript, tokenizer, part_budget)
-            self._tokens = 0
-            self._pass_base = 0
-            self._passes_done = 0
-            self._last_tps = 0.0
             self._passes_total = 1 if len(parts) == 1 else len(parts) + 1
 
             if len(parts) == 1:
@@ -619,8 +608,7 @@ class NotesWorker(QThread):
                         model, tokenizer,
                         _request(tokenizer, self.model_name, part_text, part),
                         stream=False))
-                if not self._stop:
-                    self._combine(model, tokenizer, part_notes, final_budget, merge_budget)
+                self._combine(model, tokenizer, part_notes, final_budget, merge_budget)
 
             if self._stop:
                 self.chunk.emit("\n\n*(cancelled)*")

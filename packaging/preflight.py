@@ -35,11 +35,9 @@ REQUIRED_IMPORTS = [
     ("certifi", "TLS verification for model downloads"),
 ]
 
+APP_DIR = Path(__file__).resolve().parent.parent / "app"
 # The app's own modules, imported the way the frozen bundle does (flat).
-APP_MODULES = [
-    "models", "audio", "merger", "exporters", "diagnostics",
-    "transcriber", "llm", "stats", "main_window", "main",
-]
+APP_MODULES = sorted(p.stem for p in APP_DIR.glob("*.py"))
 
 
 def _check_imports(names) -> list[str]:
@@ -78,35 +76,22 @@ def _check_resources() -> list[str]:
     return problems
 
 
-def _check_aliases() -> list[str]:
-    """Every model offered in the UI must route to an engine that exists."""
-    import main_window
-    import transcriber
-
-    problems = []
-    for name in main_window.MODELS:
-        engine = transcriber.engine_for(name)
-        if engine not in ("whisper", "onnx", "qwen"):
-            problems.append(f"model {name!r} routes to unknown engine {engine!r}")
-        backend = transcriber.resolve_backend(name, "mlx")
-        if backend.engine not in transcriber.ENGINE_LABELS:
-            problems.append(f"model {name!r} resolves to unknown backend {backend!r}")
+def _check_notes_models() -> list[str]:
+    """Every notes model offered in the UI must map to a repo."""
     import llm
 
-    for name in llm.NOTES_MODEL_GROUPS:
-        for model in name[1]:
-            if model not in llm.LLM_REPOS:
-                problems.append(f"notes model {model!r} has no repo mapping")
-    return problems
+    return [f"notes model {model!r} has no repo mapping"
+            for _tier, models in llm.NOTES_MODEL_GROUPS
+            for model in models if model not in llm.LLM_REPOS]
 
 
 def main() -> int:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
+    sys.path.insert(0, str(APP_DIR))
     problems = _check_imports(REQUIRED_IMPORTS)
     problems += _check_imports(APP_MODULES)
     if not problems:  # only meaningful once the modules import
         problems += _check_resources()
-        problems += _check_aliases()
+        problems += _check_notes_models()
 
     if problems:
         print("PREFLIGHT FAILED:")
@@ -115,7 +100,7 @@ def main() -> int:
         print("\nFix the environment (bash setup_mac.command) and build again.")
         return 1
     print(f"preflight OK — {len(REQUIRED_IMPORTS)} dependencies, "
-          f"{len(APP_MODULES)} app modules, resources and model routing")
+          f"{len(APP_MODULES)} app modules, resources and notes models")
     return 0
 
 

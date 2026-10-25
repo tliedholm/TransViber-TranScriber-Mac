@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
+import gc
 import sys
 import threading
 from typing import NamedTuple
 
-import cuda_setup  # noqa: F401  (must run before ctranslate2 loads)
-
 from PySide6.QtCore import QThread, Signal
 
 import diagnostics
-from audio import AudioFileError, Timing, decode_track_audio
+from audio import SAMPLE_RATE, AudioFileError, Timing, decode_track_audio
 from models import RunConfig, Segment, Track
 
 # A pause this long between words splits a Whisper segment in two. Whisper can
@@ -149,12 +148,9 @@ def fallback_backend(backend: Backend) -> Backend | None:
 _model_cache: dict = {"key": None, "model": None}
 
 
-def free_asr_models() -> None:
-    """Drop the cached ASR model so the notes LLM can have the memory."""
-    import gc
-
-    _model_cache["key"] = None
-    _model_cache["model"] = None
+def release_unified_memory() -> None:
+    """Hand back what dropping a model freed: Python's garbage, then MLX's
+    buffer cache, which otherwise keeps the GPU memory for reuse."""
     gc.collect()
     try:
         import mlx.core as mx
@@ -162,6 +158,23 @@ def free_asr_models() -> None:
         mx.clear_cache()
     except ImportError:
         pass
+
+
+def free_asr_models() -> None:
+    """Drop every loaded ASR model so the notes LLM can have the memory."""
+    _model_cache["key"] = None
+    _model_cache["model"] = None
+    # Two engines keep models of their own, out of _model_cache's sight, and
+    # each would stay resident under the notes model: mlx-whisper's weights,
+    # loaded on its first transcribe, and the forced aligner that gives Qwen
+    # its word timestamps.
+    whisper = getattr(sys.modules.get("mlx_whisper.transcribe"), "ModelHolder", None)
+    if whisper is not None:
+        whisper.model = whisper.model_path = None
+    qwen = getattr(sys.modules.get("mlx_qwen3_asr.load_models"), "_ModelHolder", None)
+    if qwen is not None:
+        qwen.clear()
+    release_unified_memory()
 
 
 # ---- Model-download progress -----------------------------------------------
@@ -176,14 +189,27 @@ def free_asr_models() -> None:
 _download_lock = threading.Lock()
 _download_bars: dict[int, tuple[int, int]] = {}
 _download_cb = None  # set only while a model load is in flight
+_hook_installed = False
 
 
 def begin_download_reporting(callback) -> None:
     """Route Hugging Face byte progress to one active worker."""
-    global _download_cb
+    global _download_cb, _hook_installed
     with _download_lock:
+        if not _hook_installed:
+            # On the first run rather than at import: the hook imports
+            # faster-whisper, which the window does not need to open.
+            _install_download_hook()
+            _hook_installed = True
         _download_bars.clear()
     _download_cb = callback
+
+
+def reset_download_reporting(callback) -> None:
+    """Forget finished download bars and hide the readout until a new one starts."""
+    with _download_lock:
+        _download_bars.clear()
+    callback(-1, 0.0)
 
 
 def end_download_reporting(callback) -> None:
@@ -193,9 +219,7 @@ def end_download_reporting(callback) -> None:
     # one owner. Do not compare PySide bound-signal wrappers: each attribute
     # access can produce a distinct Python wrapper for the same Qt signal.
     _download_cb = None
-    with _download_lock:
-        _download_bars.clear()
-    callback(-1, 0.0)
+    reset_download_reporting(callback)
 
 
 def _report_download(bar) -> None:
@@ -256,7 +280,22 @@ def _install_download_hook() -> None:
     faster_whisper.utils.disabled_tqdm = hub_tqdm_class
 
 
-_install_download_hook()
+def split_timed_words(words: list[tuple[float, float, str]], speaker: str, *,
+                      sep: str = "", offset: float = 0.0,
+                      max_gap: float = SPLIT_GAP_SECONDS) -> list[Segment]:
+    """Group (start, end, text) words into Segments, splitting wherever the
+    silence between two words is longer than `max_gap`. Every engine with
+    word timestamps goes through here. `words` must not be empty; `offset`
+    is added to every time."""
+    groups = [[words[0]]]
+    for word in words[1:]:
+        if word[0] - groups[-1][-1][1] > max_gap:
+            groups.append([word])
+        else:
+            groups[-1].append(word)
+    return [Segment(speaker, offset + group[0][0], offset + group[-1][1],
+                    sep.join(text for _start, _end, text in group))
+            for group in groups]
 
 
 def split_on_word_gaps(fw_segment, speaker: str, max_gap: float = SPLIT_GAP_SECONDS) -> list[Segment]:
@@ -264,24 +303,23 @@ def split_on_word_gaps(fw_segment, speaker: str, max_gap: float = SPLIT_GAP_SECO
     words = fw_segment.words
     if not words:
         return [Segment(speaker, fw_segment.start, fw_segment.end, fw_segment.text)]
-    pieces: list[Segment] = []
-    current = [words[0]]
-    for word in words[1:]:
-        if word.start - current[-1].end > max_gap:
-            pieces.append(Segment(speaker, current[0].start, current[-1].end,
-                                  "".join(w.word for w in current)))
-            current = [word]
-        else:
-            current.append(word)
-    pieces.append(Segment(speaker, current[0].start, current[-1].end,
-                          "".join(w.word for w in current)))
-    return pieces
+    return split_timed_words([(w.start, w.end, w.word) for w in words], speaker,
+                             max_gap=max_gap)
 
 
 def cuda_available() -> bool:
     import ctranslate2
 
     return ctranslate2.get_cuda_device_count() > 0
+
+
+def mlx_installed() -> bool:
+    """Whether mlx-whisper is installed, without importing it: importing it
+    pulls in numba, scipy and mlx, most of a second at every launch, and
+    the window only needs to know for a label."""
+    import importlib.util
+
+    return sys.platform == "darwin" and importlib.util.find_spec("mlx_whisper") is not None
 
 
 def mlx_available() -> bool:
@@ -343,8 +381,7 @@ def _get_model(model_name: str, backend: Backend, status_cb) -> object:
     """
     key = (model_name, backend)
     if _model_cache["key"] != key:
-        _model_cache["key"] = None
-        _model_cache["model"] = None  # free previous model before loading a new one
+        free_asr_models()  # the previous model goes before the new one loads
         status_cb(f"Loading model '{model_name}' ({backend.label}) — first use "
                   "downloads it, which can take several minutes for large models…")
         if backend.engine == "onnx":
@@ -380,10 +417,9 @@ def _get_model(model_name: str, backend: Backend, status_cb) -> object:
         else:
             from faster_whisper import WhisperModel
 
-            ct2_device = "cuda" if backend.device == "cuda" else "cpu"
-            compute_type = "float16" if ct2_device == "cuda" else "int8"
+            compute_type = "float16" if backend.device == "cuda" else "int8"
             fw_name = WHISPER_ALIASES.get(model_name.lower(), model_name)
-            _model_cache["model"] = WhisperModel(fw_name, device=ct2_device,
+            _model_cache["model"] = WhisperModel(fw_name, device=backend.device,
                                                  compute_type=compute_type)
         _model_cache["key"] = key
     return _model_cache["model"]
@@ -448,9 +484,11 @@ class TranscribeWorker(QThread):
     def _decode(self, i: int):
         """Track i's audio, 16 kHz mono on its file's own clock.
 
-        Every engine decodes here, faster-whisper included: its own decoder
-        ignores timestamps (see audio.py), so a gap or a late start in the
-        file would move every word after it.
+        Every engine decodes here, never from a path. faster-whisper's own
+        decoder ignores timestamps (see audio.py), so a gap or a late start
+        in the file would move every word after it; mlx-whisper's shells out
+        to the ffmpeg CLI, which a stock Mac does not have, and the failure
+        would be retried on the CPU engine, silently losing the GPU.
         """
         track = self.tracks[i]
         timing = Timing()
@@ -462,21 +500,39 @@ class TranscribeWorker(QThread):
         return audio
 
     def _transcribe_track(self, model, i: int) -> bool:
-        """Transcribe one track. Returns True if cancelled mid-track."""
-        engine = self.backend.engine if self.backend else engine_for(self.model_name)
-        if engine == "onnx":
-            return self._transcribe_track_onnx(model, i)
-        if engine == "qwen":
-            return self._transcribe_track_qwen(model, i)
-        if engine == "whisper-mlx":
-            return self._transcribe_track_mlx(model, i)
-        track = self.tracks[i]
+        """Transcribe one track. Returns True if cancelled mid-track.
+
+        The start, the decode, the stop check and the finish are the same for
+        every engine; each engine method only turns the audio into segments
+        and returns the language it heard, or None if it was cancelled.
+        """
+        engines = {
+            "whisper-ct2": self._transcribe_ct2,
+            "whisper-mlx": self._transcribe_mlx,
+            "qwen": self._transcribe_qwen,
+            "onnx": self._transcribe_onnx,
+        }
+        transcribe = engines[self.backend.engine]
         self.track_started.emit(i)
-        source = self._decode(i)
+        audio = self._decode(i)
         if self._stop:
             return True
+        language = transcribe(model, i, audio)
+        if language is None:
+            return True
+        self.track_progress.emit(i, 100)
+        self.track_done.emit(i, language, self.config())
+        return False
+
+    def _progress(self, i: int, reached: float, total: float) -> None:
+        if total > 0:
+            self.track_progress.emit(i, min(100, int(reached / total * 100)))
+
+    def _transcribe_ct2(self, model, i: int, audio) -> str | None:
+        """faster-whisper (CTranslate2), segment by segment."""
+        track = self.tracks[i]
         segments, info = model.transcribe(
-            source,
+            audio,
             language=self.language,
             beam_size=5,
             vad_filter=True,
@@ -487,17 +543,14 @@ class TranscribeWorker(QThread):
         duration = info.duration or track.duration or 0.0
         for seg in segments:
             if self._stop:
-                return True
+                return None
             for piece in split_on_word_gaps(seg, track.speaker):
                 self.segment_ready.emit(i, piece)
-            if duration > 0:
-                self.track_progress.emit(i, min(100, int(seg.end / duration * 100)))
-        self.track_progress.emit(i, 100)
-        self.track_done.emit(i, info.language or "", self.config())
-        return False
+            self._progress(i, seg.end, duration)
+        return info.language or ""
 
-    def _transcribe_track_mlx(self, model: _MlxModel, i: int) -> bool:
-        """Transcribe one track with mlx-whisper (Apple-silicon GPU).
+    def _transcribe_mlx(self, model: _MlxModel, i: int, audio) -> str | None:
+        """mlx-whisper (Apple-silicon GPU).
 
         mlx_whisper.transcribe is blocking, so segments arrive when the whole
         track is done rather than live. Whisper's silence-spanning segments
@@ -505,17 +558,9 @@ class TranscribeWorker(QThread):
         """
         import mlx_whisper
 
-        track = self.tracks[i]
-        self.track_started.emit(i)
-        # Always decode through PyAV instead of handing mlx-whisper a path:
-        # its own loader shells out to the ffmpeg CLI, which a stock Mac does
-        # not have. A plain (non-multitrack) file would fail that way and get
-        # retried on the CPU engine, silently losing the GPU speedup.
-        source = self._decode(i)
-        if self._stop:
-            return True
+        speaker = self.tracks[i].speaker
         result = mlx_whisper.transcribe(
-            source,
+            audio,
             path_or_hf_repo=model.repo,
             language=self.language,
             word_timestamps=True,
@@ -524,7 +569,7 @@ class TranscribeWorker(QThread):
             verbose=None,
         )
         if self._stop:
-            return True
+            return None
         for seg in result.get("segments", []):
             # mlx-whisper has no VAD filter; drop likely-hallucinated silence.
             if seg.get("no_speech_prob", 0.0) > 0.6:
@@ -532,26 +577,15 @@ class TranscribeWorker(QThread):
             words = seg.get("words") or []
             if not words:
                 self.segment_ready.emit(
-                    i, Segment(track.speaker, seg["start"], seg["end"], seg["text"]))
+                    i, Segment(speaker, seg["start"], seg["end"], seg["text"]))
                 continue
-            current = [words[0]]
-            for word in words[1:]:
-                if word["start"] - current[-1]["end"] > SPLIT_GAP_SECONDS:
-                    self.segment_ready.emit(i, Segment(
-                        track.speaker, current[0]["start"], current[-1]["end"],
-                        "".join(w["word"] for w in current)))
-                    current = [word]
-                else:
-                    current.append(word)
-            self.segment_ready.emit(i, Segment(
-                track.speaker, current[0]["start"], current[-1]["end"],
-                "".join(w["word"] for w in current)))
-        self.track_progress.emit(i, 100)
-        self.track_done.emit(i, result.get("language") or "", self.config())
-        return False
+            for piece in split_timed_words(
+                    [(w["start"], w["end"], w["word"]) for w in words], speaker):
+                self.segment_ready.emit(i, piece)
+        return result.get("language") or ""
 
-    def _transcribe_track_qwen(self, model: _QwenModel, i: int) -> bool:
-        """Transcribe one track with Qwen3-ASR (mlx-qwen3-asr, Apple-silicon GPU).
+    def _transcribe_qwen(self, model: _QwenModel, i: int, audio) -> str | None:
+        """Qwen3-ASR (mlx-qwen3-asr, Apple-silicon GPU).
 
         Qwen must never see silence: on speech+silence mixes (i.e. sparse
         speaker tracks) it hallucinates repeated text, and the forced aligner
@@ -565,11 +599,7 @@ class TranscribeWorker(QThread):
         """
         from faster_whisper.vad import VadOptions, get_speech_timestamps
 
-        track = self.tracks[i]
-        self.track_started.emit(i)
-        audio = self._decode(i)
-        if self._stop:
-            return True
+        speaker = self.tracks[i].speaker
         regions = get_speech_timestamps(
             audio,
             vad_options=VadOptions(max_speech_duration_s=240, speech_pad_ms=400),
@@ -580,10 +610,10 @@ class TranscribeWorker(QThread):
         language = ""
         for region in regions:
             if self._stop:
-                return True
-            offset = region["start"] / 16000
+                return None
+            offset = region["start"] / SAMPLE_RATE
             result = model.session.transcribe(
-                (audio[region["start"]:region["end"]], 16000),
+                (audio[region["start"]:region["end"]], SAMPLE_RATE),
                 context=self.hotwords,
                 language=forced,
                 return_timestamps=True,
@@ -591,58 +621,31 @@ class TranscribeWorker(QThread):
             )
             language = result.language or language
             words = result.segments or []
-            if not words:
-                if result.text.strip():
-                    # Aligner produced nothing but there is text: keep it,
-                    # spanning the region rather than dropped.
-                    self.segment_ready.emit(i, Segment(
-                        track.speaker, offset, region["end"] / 16000, result.text))
-            else:
-                current = [words[0]]
-                for word in words[1:]:
-                    if word["start"] - current[-1]["end"] > SPLIT_GAP_SECONDS:
-                        self.segment_ready.emit(i, Segment(
-                            track.speaker, offset + current[0]["start"],
-                            offset + current[-1]["end"],
-                            " ".join(w["text"] for w in current)))
-                        current = [word]
-                    else:
-                        current.append(word)
+            if words:
+                for piece in split_timed_words(
+                        [(w["start"], w["end"], w["text"]) for w in words], speaker,
+                        sep=" ", offset=offset):
+                    self.segment_ready.emit(i, piece)
+            elif result.text.strip():
+                # Aligner produced nothing but there is text: keep it,
+                # spanning the region rather than dropped.
                 self.segment_ready.emit(i, Segment(
-                    track.speaker, offset + current[0]["start"],
-                    offset + current[-1]["end"],
-                    " ".join(w["text"] for w in current)))
-            if len(audio):
-                self.track_progress.emit(i, min(100, int(region["end"] / len(audio) * 100)))
-        self.track_progress.emit(i, 100)
-        self.track_done.emit(i, language, self.config())
-        return False
+                    speaker, offset, region["end"] / SAMPLE_RATE, result.text))
+            self._progress(i, region["end"], len(audio))
+        return language
 
-    def _transcribe_track_onnx(self, model, i: int) -> bool:
-        """Transcribe one track with an onnx-asr model (Parakeet etc.)."""
-        track = self.tracks[i]
-        self.track_started.emit(i)
-        audio = self._decode(i)
-        if self._stop:
-            return True
-        duration = len(audio) / 16000
-        for res in model.recognize(audio, sample_rate=16000):
+    def _transcribe_onnx(self, model, i: int, audio) -> str | None:
+        """onnx-asr (Parakeet, Canary), which reports no language."""
+        speaker = self.tracks[i].speaker
+        duration = len(audio) / SAMPLE_RATE
+        for res in model.recognize(audio, sample_rate=SAMPLE_RATE):
             if self._stop:
-                return True
+                return None
             if not res.text.strip():
                 continue
-            self.segment_ready.emit(i, Segment(track.speaker, res.start, res.end, res.text))
-            if duration > 0:
-                self.track_progress.emit(i, min(100, int(res.end / duration * 100)))
-        self.track_progress.emit(i, 100)
-        self.track_done.emit(i, "", self.config())
-        return False
-
-    def _reset_download(self) -> None:
-        """Forget finished download bars and hide the UI readout until a new one starts."""
-        with _download_lock:
-            _download_bars.clear()
-        self.download_progress.emit(-1, 0.0)
+            self.segment_ready.emit(i, Segment(speaker, res.start, res.end, res.text))
+            self._progress(i, res.end, duration)
+        return ""
 
     def run(self) -> None:
         # Before any model loads or downloads: no backend can transcribe a
@@ -655,6 +658,10 @@ class TranscribeWorker(QThread):
                        f"Auto-detect, or a Whisper model.")
             self.finished_all.emit(False)
             return
+        # The notes LLM and an ASR model never share unified memory.
+        import llm
+
+        llm.free_llm()
         # Model weights can download at load time or — on the mlx-whisper
         # path — lazily during the first transcribe call, so the download
         # callback stays active for the whole run. Resets between phases stop
@@ -679,13 +686,14 @@ class TranscribeWorker(QThread):
                 self.finished_all.emit(False)
                 return
             self.model_status.emit(f"Running on {self.backend.label}.")
-            self._reset_download()
+            reset_download_reporting(self.download_progress.emit)
 
             cancelled = False
             for i in self.indices:
                 if self._stop:
                     cancelled = True
                     break
+                alternative = None
                 try:
                     cancelled = self._transcribe_track(model, i)
                 except AudioFileError as exc:
@@ -712,18 +720,23 @@ class TranscribeWorker(QThread):
                             f"{self.backend.label}: error on "
                             f"{self.tracks[i].path.name} ({exc}) — "
                             f"retrying on {alternative.label}…")
-                        try:
-                            model = _get_model(self.model_name, alternative,
-                                               self.model_status.emit)
-                            self.backend = alternative
-                            cancelled = self._transcribe_track(model, i)
-                        except Exception as retry_exc:
-                            diagnostics.log_exception(
-                                "transcribe (retry)", retry_exc,
-                                track=str(self.tracks[i].path),
-                                model=self.model_name, backend=alternative.label)
-                            self.track_failed.emit(i, str(retry_exc))
-                self._reset_download()
+                # The retry runs after the except block, not in it: the
+                # failure's traceback holds the failed attempt's frames, and
+                # with them its model and the track's audio, gigabytes for
+                # a long track, which would stay pinned for the whole retry.
+                if alternative is not None:
+                    try:
+                        model = _get_model(self.model_name, alternative,
+                                           self.model_status.emit)
+                        self.backend = alternative
+                        cancelled = self._transcribe_track(model, i)
+                    except Exception as retry_exc:
+                        diagnostics.log_exception(
+                            "transcribe (retry)", retry_exc,
+                            track=str(self.tracks[i].path),
+                            model=self.model_name, backend=alternative.label)
+                        self.track_failed.emit(i, str(retry_exc))
+                reset_download_reporting(self.download_progress.emit)
 
             self.finished_all.emit(cancelled)
         finally:

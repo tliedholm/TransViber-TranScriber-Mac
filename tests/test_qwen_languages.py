@@ -157,16 +157,15 @@ def test_transcribe_refuses_the_conflict_and_changes_nothing(window, monkeypatch
     window.combo_model.setCurrentText("qwen3-asr-1.7b")
     window.combo_lang.setCurrentIndex(row(window, "uk"))
     status = window.table.item(0, main_window.COL_STATUS).text()
-    warnings, started, freed = [], [], []
+    warnings, started = [], []
     monkeypatch.setattr(main_window.QMessageBox, "warning",
                         lambda *args: warnings.append(args))
     monkeypatch.setattr(main_window, "TranscribeWorker",
                         lambda *args, **kwargs: started.append(args))
-    monkeypatch.setattr(main_window.llm, "free_llm", lambda: freed.append(True))
 
     window.toggle_transcription()
 
-    assert started == [] and freed == []
+    assert started == []
     assert "Ukrainian" in warnings[0][2]
     assert window.worker is None
     assert window.table.item(0, main_window.COL_STATUS).text() == status

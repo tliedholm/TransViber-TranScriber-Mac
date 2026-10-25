@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import html
 import json
 import os
 import re
@@ -11,8 +12,8 @@ import stat
 from datetime import datetime
 from pathlib import Path
 
-from merger import coalesce
-from models import Segment, Track, TrackStatus
+from merger import coalesce, merge_tracks
+from models import Segment, Track
 
 # Characters that would otherwise turn a speaker's name into Markdown markup:
 # a name like *Nyx* or a nickname written as _Bones_ silently became emphasis,
@@ -26,8 +27,7 @@ def _md(text: str) -> str:
 
 def _vtt(text: str) -> str:
     """Escape a name for a WebVTT <v ...> cue tag."""
-    return (text.replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;"))
+    return html.escape(text, quote=False)
 
 
 def hms(seconds: float) -> str:
@@ -126,7 +126,7 @@ def _models_used(tracks: list[Track]) -> list[str]:
 
 
 def to_json(segments: list[Segment], tracks: list[Track]) -> str:
-    exported = [t for t in tracks if t.status != TrackStatus.ERROR]
+    exported = [t for t in tracks if t.in_transcript]
     data = {
         "created": datetime.now().astimezone().isoformat(timespec="seconds"),
         # A list, because a transcript assembled over several runs genuinely
@@ -134,8 +134,7 @@ def to_json(segments: list[Segment], tracks: list[Track]) -> str:
         # mixed transcript look like one model's work.
         "models": _models_used(exported),
         "tracks": [_track_entry(t) for t in exported],
-        "excluded_tracks": [_track_entry(t) for t in tracks
-                            if t.status == TrackStatus.ERROR],
+        "excluded_tracks": [_track_entry(t) for t in tracks if not t.in_transcript],
         "segments": [
             {
                 "speaker": seg.speaker,
@@ -149,11 +148,12 @@ def to_json(segments: list[Segment], tracks: list[Track]) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+# Every renderer takes (segments, tracks); only JSON records the tracks.
 EXPORTERS = {
-    ".md": to_markdown,
-    ".txt": to_text,
-    ".srt": to_srt,
-    ".vtt": to_vtt,
+    ".md": lambda segments, _tracks: to_markdown(segments),
+    ".txt": lambda segments, _tracks: to_text(segments),
+    ".srt": lambda segments, _tracks: to_srt(segments),
+    ".vtt": lambda segments, _tracks: to_vtt(segments),
     ".json": to_json,
 }
 
@@ -264,26 +264,27 @@ def write_file(path: Path, text: str) -> None:
 
 
 def _render(path: Path, segments: list[Segment], tracks: list[Track]) -> str:
-    ext = path.suffix.lower()
-    if ext == ".json":
-        return to_json(segments, tracks)
-    if ext in EXPORTERS:
-        return EXPORTERS[ext](segments)
-    raise ValueError(f"Unsupported export format: {ext}")
+    render = EXPORTERS.get(path.suffix.lower())
+    if render is None:
+        raise ValueError(f"Unsupported export format: {path.suffix.lower()}")
+    return render(segments, tracks)
 
 
-def export(path: Path, segments: list[Segment], tracks: list[Track]) -> None:
-    write_file(path, _render(path, segments, tracks))
+def export(path: Path, tracks: list[Track]) -> None:
+    """Write the tracks' transcript as `path`'s format, merged as they are now."""
+    write_file(path, _render(path, merge_tracks(tracks), tracks))
 
 
-def export_all(base_path: Path, segments: list[Segment], tracks: list[Track]) -> list[Path]:
+def export_all(base_path: Path, tracks: list[Track]) -> list[Path]:
     """Write every format, each file replaced whole or not at all.
 
-    All five are rendered and staged before any file is replaced, so an
-    error in rendering, or a disk that fills while staging, changes
-    nothing. The set as a whole is not atomic: if one replacement fails,
-    the ExportError raised names the formats already written and the ones
-    still holding their old contents.
+    The tracks are merged once, here, at write time, so every format and the
+    JSON's track list come from one snapshot. All five are rendered and
+    staged before any file is replaced, so an error in rendering, or a disk
+    that fills while staging, changes nothing. The set as a whole is not
+    atomic: if one replacement fails, the ExportError raised names the
+    formats already written and the ones still holding their old contents.
     """
+    segments = merge_tracks(tracks)
     return _publish([(target, _render(target, segments, tracks))
                      for target in (base_path.with_suffix(ext) for ext in EXPORTERS)])

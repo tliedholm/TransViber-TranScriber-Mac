@@ -101,8 +101,15 @@ class Track:
     previous: "TrackResult | None" = None
 
     @property
-    def is_subtrack(self) -> bool:
-        return self.stream_index is not None or self.channel is not None
+    def in_transcript(self) -> bool:
+        """Whether its segments belong in the transcript and the exports.
+
+        A failed track's do not: an engine can emit segments and *then*
+        raise, and that fragment of one speaker's audio would make an
+        incomplete transcript look finished. They stay on the Track, so
+        nothing is thrown away silently and the UI can say how many.
+        """
+        return self.status is not TrackStatus.ERROR
 
     def stash_result(self) -> None:
         """Set the current DONE result aside before a rerun overwrites it."""
@@ -166,6 +173,12 @@ AUDIO_EXTENSIONS = {
     ".flac", ".m4a", ".mp4", ".aac", ".mp3", ".wav", ".ogg",
     ".opus", ".wma", ".webm", ".mka", ".mkv", ".mov", ".aif", ".aiff",
 }
+
+
+def audio_paths(candidates) -> list[Path]:
+    """The candidates (paths or strings) named like audio files this app opens."""
+    return [path for path in map(Path, candidates)
+            if path.suffix.lower() in AUDIO_EXTENSIONS]
 
 
 def default_speaker_name(path: Path) -> str:

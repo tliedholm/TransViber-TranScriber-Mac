@@ -91,21 +91,21 @@ def probe_streams(path: Path) -> list[dict]:
     import av
 
     with av.open(str(path)) as container:
-        fallback = container.duration / av.time_base if container.duration else 0.0
-        streams = []
-        for stream in container.streams.audio:
-            if stream.duration and stream.time_base:
-                duration = float(stream.duration * stream.time_base)
-            else:
-                duration = fallback
-            streams.append({"channels": _stream_channels(stream), "duration": duration})
-        return streams
+        return [{"channels": _stream_channels(stream),
+                 "duration": _expected_seconds(container, stream)}
+                for stream in container.streams.audio]
 
 
 def _channel_suffixes(count: int) -> list[str]:
     if count == 2:
         return [" L", " R"]
     return [f" Ch{n + 1}" for n in range(count)]
+
+
+def channel_tracks(path: Path, speaker: str, channels: int, **fields) -> list[Track]:
+    """One Track per channel of a stream, named `speaker` plus " L"/" R" or " ChN"."""
+    return [Track(path=path, speaker=speaker + suffix, channel=ch, **fields)
+            for ch, suffix in enumerate(_channel_suffixes(channels))]
 
 
 def tracks_for_file(path: Path, split_stereo: bool = False) -> list[Track]:
@@ -135,10 +135,8 @@ def tracks_for_file(path: Path, split_stereo: bool = False) -> list[Track]:
         name = f"{base} T{si + 1}" if multi_stream else base
         channels = stream["channels"]
         if channels > 2 or (channels == 2 and split_stereo):
-            for ch, suffix in enumerate(_channel_suffixes(channels)):
-                tracks.append(Track(path=path, speaker=name + suffix,
-                                    duration=stream["duration"],
-                                    stream_index=si, channel=ch))
+            tracks += channel_tracks(path, name, channels, duration=stream["duration"],
+                                     stream_index=si)
         else:
             tracks.append(Track(path=path, speaker=name, duration=stream["duration"],
                                 stream_index=si if multi_stream else None))
@@ -336,11 +334,13 @@ def _placed(blocks, rate: int, path: Path, timing: Timing):
 
 
 def _expected_seconds(container, stream) -> float:
-    """How long the stream says it is, or 0 when it doesn't."""
+    """How long the stream says it is, else the container, or 0 when neither does."""
+    import av
+
     if stream.duration and stream.time_base:
         return float(stream.duration * stream.time_base)
     if container.duration:
-        return container.duration / 1_000_000
+        return container.duration / av.time_base
     return 0.0
 
 
