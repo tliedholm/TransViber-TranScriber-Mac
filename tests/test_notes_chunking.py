@@ -252,6 +252,8 @@ def offline_run(monkeypatch):
     stub.free_asr_models = lambda: None
     monkeypatch.setitem(sys.modules, "transcriber", stub)
     monkeypatch.setattr(llm.diagnostics, "log_exception", lambda *a, **k: None)
+    # Whatever GPU runs the tests, the worker sizes passes as if it fits.
+    monkeypatch.setattr(llm, "gpu_budget", lambda: None)
 
     def run(worker, context=CONTEXT):
         tok = ChatTokenizer()
@@ -335,4 +337,5 @@ def test_gpt_oss_gets_the_smaller_pass(offline_run):
     offline_run(worker, context=131_072)
     assert not worker.failures
     assert len(worker.prompts) > 2
-    assert all(len(p) <= llm.prompt_limit(32_768) for p in worker.prompts)
+    assert all(len(p) <= llm.prompt_limit(llm.pass_limit("gpt-oss-20b"))
+               for p in worker.prompts)

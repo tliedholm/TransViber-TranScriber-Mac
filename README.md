@@ -128,16 +128,19 @@ tier starts with its best pick for a 16 GB Mac:
 | Max detail | `qwen3.5-9b`, `gemma-4-12b`, `qwen3-14b`, `gemma-3-12b`, `mistral-nemo-12b` |
 | Standard | `qwen3-8b`, `llama-3.1-8b`, `ministral-8b` |
 | Quick | `qwen3.5-4b` (default), `qwen3-4b`, `llama-3.2-3b`, `phi-4-mini`, `granite-3.3-2b` |
-| Experimental | `gpt-oss-20b` |
+| Experimental (24 GB+ Mac) | `gpt-oss-20b` |
 
 - **Qwen3.5** (`qwen3.5-9b`, `qwen3.5-4b`, March 2026) is the recommended
   choice. It reads up to 262,144 tokens and keeps only a small cache per
   token, so a typical session is written up in one pass.
 - **Gemma 4 12B** (May 2026) is a second opinion with a different writing
   voice, about the same size as Qwen3.5-9B.
-- **gpt-oss-20b** (OpenAI, 2025) is fast, but its 11.2 GB of weights leave
-  little room on a 16 GB Mac, so each pass holds at most 32,768 tokens. It
-  always reasons before writing; that part is kept out of the notes.
+- **gpt-oss-20b** (OpenAI, 2025) needs a Mac with 24 GB of memory or more.
+  On a 16 GB Mac its 11.2 GB of weights leave too little room for a
+  transcript (it runs out of GPU memory past about 8,000 tokens), so it is
+  greyed out there and AI Notes refuses it. Each pass holds at most 32,768
+  tokens. It always reasons before writing; that part is kept out of the
+  notes.
 
 You can also type any MLX repo id (for example from mlx-community).
 Optional instructions (e.g. "focus on loot and quest leads") are added to the
@@ -146,7 +149,8 @@ and then combined, with every pass sized to the model's real context window
 and kept to 65,536 tokens, so the model's cache fits a 16 GB Mac. Instructions too long
 to leave room for the transcript are refused up front. Speech and notes
 models are never loaded at the same time, so they don't compete for unified
-memory. **Export Notes…** saves the notes as Markdown or plain text.
+memory. If a notes model still runs out of GPU memory, the app says so and
+unloads it. **Export Notes…** saves the notes as Markdown or plain text.
 
 ## Engines and models
 

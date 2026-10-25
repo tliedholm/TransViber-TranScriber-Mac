@@ -19,7 +19,7 @@ NOTES_MODEL_GROUPS = [
     ("Standard Speed (Medium Tier)", ["qwen3-8b", "llama-3.1-8b", "ministral-8b"]),
     ("Quick Review (Small Tier)", ["qwen3.5-4b", "qwen3-4b", "llama-3.2-3b",
                                    "phi-4-mini", "granite-3.3-2b"]),
-    ("Experimental (tight on 16 GB)", ["gpt-oss-20b"]),
+    ("Experimental (24 GB+ Mac)", ["gpt-oss-20b"]),
 ]
 
 LLM_REPOS = {
@@ -46,7 +46,7 @@ LLM_REPOS = {
     "phi-4-mini": "mlx-community/Phi-4-mini-instruct-4bit",
     "granite-3.3-2b": "mlx-community/granite-3.3-2b-instruct-4bit",
     # 11.2 GB, the smallest MLX build there is (its experts ship as MXFP4), of
-    # the ~12.7 GB a 16 GB Mac lets the GPU use: see PASS_LIMITS.
+    # the ~12.7 GB a 16 GB Mac lets the GPU use: see GPU_NEEDS.
     "gpt-oss-20b": "mlx-community/gpt-oss-20b-MXFP4-Q4",
 }
 
@@ -155,10 +155,19 @@ CONTEXT_LIMITS = (2_048, 262_144)  # sanity clamp on whatever a model claims
 # Llama 3.x 131,072: a full window of an ordinary-attention 8B model is about
 # 16 GB of cache on its own. At 65,536 the cache is about 2 GB for Qwen3.5-9B
 # and 1.4 GB for Gemma 4 12B, on top of 6-7 GB of weights, and one pass still
-# holds a typical session. gpt-oss-20b's weights alone take 11.2 GB of the
-# 12.7, so it gets half.
+# holds a typical session. gpt-oss-20b gets half: see GPU_NEEDS.
 MAX_PASS_TOKENS = 65_536
 PASS_LIMITS = (("gpt-oss", 32_768),)
+
+# Bytes of GPU memory (gpu_budget()) a model needs before the app will run
+# it, and the Mac that has them. Measured on the 16 GB M1 Pro, whose GPU may
+# use 12.7 GB, with nothing else loaded: gpt-oss-20b's weights take 11.18 GB,
+# a 2,288-token prompt peaked at 12.06 GB and an 8,432-token one at 12.23,
+# and a 16,624-token one ran out of GPU memory. A pass needs MAX_NOTES_TOKENS
+# for the notes alone, so no pass size makes it usable there. At that rate,
+# about 28 MB per 1,000 tokens, a full 32,768-token pass peaks near 13 GB,
+# and a 24 GB Mac's GPU may use at least 17 GB.
+GPU_NEEDS = (("gpt-oss", (16_000_000_000, "24 GB")),)
 
 # Slack for tokenizer disagreement between counting content on its own and
 # counting it inside the whole prompt (merges across the seam, a BOS counted
@@ -219,6 +228,38 @@ def sampling(model_name: str) -> dict:
 def pass_limit(model_name: str) -> int:
     """The most one pass of this model may hold (MAX_PASS_TOKENS, PASS_LIMITS)."""
     return _for_family(PASS_LIMITS, model_name, MAX_PASS_TOKENS)
+
+
+def gpu_budget() -> int | None:
+    """Bytes of memory MLX lets the GPU use (its recommended working set), or
+    None where there is no MLX to ask."""
+    try:
+        import mlx.core as mx
+
+        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        return int(info["max_recommended_working_set_size"])
+    except Exception:  # no MLX (tests, other platforms) or no Metal device
+        return None
+
+
+def gpu_shortfall(model_name: str, budget: int | None) -> str | None:
+    """Why this Mac's GPU is too small for the model (GPU_NEEDS), or None if
+    it is big enough or the budget is unknown."""
+    need, mac = _for_family(GPU_NEEDS, model_name, (0, ""))
+    if budget is None or budget >= need:
+        return None
+    return (f"{model_name.strip()} needs a Mac with {mac} of memory or more. "
+            f"This Mac lets the GPU use {budget / 1e9:.1f} GB, and the model "
+            f"runs out of it on a real transcript. Choose another notes "
+            f"model, such as {NOTES_MODEL_GROUPS[0][1][0]}.")
+
+
+def _out_of_gpu_memory(exc: BaseException) -> bool:
+    """Whether MLX failed for want of GPU memory (Metal reports it as a
+    RuntimeError, not a MemoryError)."""
+    text = str(exc)
+    return isinstance(exc, MemoryError) or any(
+        sign in text for sign in ("Insufficient Memory", "OutOfMemory", "[metal::malloc]"))
 
 
 class ReasoningFilter:
@@ -564,6 +605,13 @@ class NotesWorker(QThread):
                        stream=True)
 
     def run(self) -> None:
+        # Before any model loads or downloads: a model too big for this GPU
+        # fails partway through a pass, after minutes of loading.
+        shortfall = gpu_shortfall(self.model_name, gpu_budget())
+        if shortfall is not None:
+            self.failed.emit(shortfall)
+            return
+
         from transcriber import (
             begin_download_reporting,
             end_download_reporting,
@@ -619,6 +667,15 @@ class NotesWorker(QThread):
         except Exception as exc:
             diagnostics.log_exception("AI notes", exc, model=self.model_name,
                                       transcript_chars=len(self.transcript))
-            self.failed.emit(f"{exc}\n\nDetails: {diagnostics.log_path()}")
+            message = str(exc)
+            if _out_of_gpu_memory(exc):
+                # Let the memory go now rather than at the next transcription.
+                free_llm()
+                budget = gpu_budget()
+                room = f" ({budget / 1e9:.1f} GB on this Mac)" if budget else ""
+                message = (f"{self.model_name} ran out of GPU memory{room}. Quit "
+                           f"other apps that use a lot of memory and try again, or "
+                           f"choose a smaller notes model.\n\n{exc}")
+            self.failed.emit(f"{message}\n\nDetails: {diagnostics.log_path()}")
         finally:
             end_download_reporting(self.download_progress.emit)

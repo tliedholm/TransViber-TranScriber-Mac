@@ -14,7 +14,8 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   `.venv/bin/python app/main.py`.
 - Tests: `.venv/bin/python -m pytest tests` (fast; no models or downloads;
   `test_align.py`'s synthetic sessions take most of the ~25 s).
-  `tests/test_track_status.py`, `tests/test_window_lifecycle.py` and
+  `tests/test_track_status.py`, `tests/test_window_lifecycle.py`,
+  `tests/test_notes_model_fit.py` and
   `tests/test_offset_and_align_window.py` build a real `MainWindow`
   offscreen, with settings in a scratch file; a new window test should
   delete its window explicitly, since PySide6 6.11 can crash collecting a
@@ -129,7 +130,16 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   (`MAX_PASS_TOKENS`, 65,536; 32,768 for gpt-oss), minus the whole request
   and `MAX_NOTES_TOKENS` of output. The cap is for memory, not the model:
   the whole prompt's KV cache sits in unified memory, and a 16 GB Mac gives
-  the GPU about 12.7 GB. What a pass carries
+  the GPU about 12.7 GB (`gpu_budget()`, MLX's recommended working set). A
+  model that can't make a useful pass in that is listed in `GPU_NEEDS`:
+  on the 16 GB M1 Pro gpt-oss-20b (11.2 GB of weights) ran an 8,192-token
+  prompt and ran out of GPU memory at 16,384, so it needs a 24 GB Mac. The
+  window greys such a model out (`_update_notes_model_choices`), keeps a
+  saved or typed one in the box rather than swapping it, and AI Notes
+  refuses it; `NotesWorker.run` refuses it again before loading. Metal's
+  "Insufficient Memory" arrives as a RuntimeError: the worker says the model
+  ran out of GPU memory and frees it (`free_llm`) rather than keep it
+  loaded until the next transcription. What a pass carries
   besides its content (system text, user instructions, chat template,
   Qwen3's and Gemma 4's thinking switch, gpt-oss's reasoning effort, Gemma
   2/3's folded system turn) is measured once a

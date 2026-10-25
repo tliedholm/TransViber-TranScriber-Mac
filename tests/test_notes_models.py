@@ -27,7 +27,7 @@ def test_each_tier_starts_with_its_newest_pick():
     assert firsts["Max Detail (Large Tier)"] == "qwen3.5-9b"
     assert firsts["Quick Review (Small Tier)"] == "qwen3.5-4b"
     assert "gemma-4-12b" in dict(llm.NOTES_MODEL_GROUPS)["Max Detail (Large Tier)"]
-    assert dict(llm.NOTES_MODEL_GROUPS)["Experimental (tight on 16 GB)"] == ["gpt-oss-20b"]
+    assert dict(llm.NOTES_MODEL_GROUPS)["Experimental (24 GB+ Mac)"] == ["gpt-oss-20b"]
 
 
 def test_older_models_stay_loadable_for_saved_settings():
@@ -75,6 +75,96 @@ def test_context_window_reads_a_multimodal_checkpoints_text_model():
         language_model=types.SimpleNamespace(
             args=types.SimpleNamespace(max_position_embeddings=262_144)))
     assert llm.context_window(model, object()) == 262_144
+
+
+# ----- models too big for this Mac's GPU -----
+
+M1_PRO_16GB = 12_713_115_648  # what MLX lets the GPU use on Trenton's Mac
+MAC_24GB = 17_179_869_184     # the least a 24 GB Mac allows
+
+
+@pytest.mark.parametrize("name", ["gpt-oss-20b", " gpt-oss-20b ",
+                                  "mlx-community/gpt-oss-20b-MXFP4-Q4"])
+def test_gpt_oss_is_refused_on_a_16_gb_mac(name):
+    reason = llm.gpu_shortfall(name, M1_PRO_16GB)
+    assert "24 GB" in reason and "12.7 GB" in reason
+    assert "qwen3.5-9b" in reason
+
+
+@pytest.mark.parametrize("name, budget", [
+    ("gpt-oss-20b", MAC_24GB),
+    ("gpt-oss-20b", None),           # no MLX to ask: never refused
+    ("qwen3.5-9b", M1_PRO_16GB),
+    ("gemma-4-12b", M1_PRO_16GB),
+    ("someone/unknown-model", M1_PRO_16GB),
+])
+def test_everything_else_is_allowed(name, budget):
+    assert llm.gpu_shortfall(name, budget) is None
+
+
+def test_no_mlx_means_no_budget(monkeypatch):
+    monkeypatch.setitem(sys.modules, "mlx", None)
+    monkeypatch.setitem(sys.modules, "mlx.core", None)
+    assert llm.gpu_budget() is None
+
+
+def test_a_refused_model_fails_before_anything_loads(monkeypatch):
+    monkeypatch.setattr(llm, "gpu_budget", lambda: M1_PRO_16GB)
+
+    def must_not_load(*args):
+        raise AssertionError("loaded a model that cannot fit")
+
+    monkeypatch.setattr(llm, "_get_llm", must_not_load)
+    monkeypatch.setattr(llm, "free_llm", must_not_load)
+    worker = llm.NotesWorker("Alice: hello", "", "gpt-oss-20b")
+    failures, chunks = [], []
+    worker.failed.connect(failures.append)
+    worker.chunk.connect(chunks.append)
+    worker.run()
+    assert failures == [llm.gpu_shortfall("gpt-oss-20b", M1_PRO_16GB)]
+    assert chunks == []  # not even the notes header
+
+
+METAL_OOM = ("[METAL] Command buffer execution failed: Insufficient Memory "
+             "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)")
+
+
+@pytest.fixture
+def failing_load(monkeypatch):
+    """Run a worker whose model load raises `error`; returns the failure text."""
+    stub = types.ModuleType("transcriber")
+    stub.begin_download_reporting = stub.end_download_reporting = lambda callback: None
+    stub.free_asr_models = lambda: None
+    monkeypatch.setitem(sys.modules, "transcriber", stub)
+    monkeypatch.setattr(llm.diagnostics, "log_exception", lambda *a, **k: None)
+    monkeypatch.setattr(llm, "gpu_budget", lambda: M1_PRO_16GB)
+    freed = []
+    monkeypatch.setattr(llm, "free_llm", lambda: freed.append(True))
+
+    def run(error):
+        def load(name, status):
+            raise error
+        monkeypatch.setattr(llm, "_get_llm", load)
+        worker = llm.NotesWorker("Alice: hello", "", "qwen3.5-9b")
+        failures = []
+        worker.failed.connect(failures.append)
+        worker.run()
+        return failures[0], bool(freed)
+
+    return run
+
+
+def test_running_out_of_gpu_memory_says_so_and_frees_the_model(failing_load):
+    message, freed = failing_load(RuntimeError(METAL_OOM))
+    assert message.startswith("qwen3.5-9b ran out of GPU memory (12.7 GB on this Mac).")
+    assert METAL_OOM in message  # the original error is kept
+    assert freed
+
+
+def test_other_failures_keep_the_model_loaded(failing_load):
+    message, freed = failing_load(RuntimeError("instructions too long"))
+    assert message.startswith("instructions too long")
+    assert not freed
 
 
 # ----- chat template switches -----
