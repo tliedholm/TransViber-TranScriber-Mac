@@ -744,9 +744,10 @@ class MainWindow(QMainWindow):
         _add_grouped_models(self.combo_notes_model, NOTES_MODEL_GROUPS)
         self.combo_notes_model.setCurrentText(DEFAULT_NOTES_MODEL)
         self.combo_notes_model.setToolTip(
-            "Local LLM (mlx-community 4-bit, Apple GPU) that writes notes on\n"
-            "the merged transcript. Bigger tiers give richer notes, slower.\n"
-            "Type any mlx-community repo id for other models."
+            "Local LLM (4-bit MLX, Apple GPU) that writes notes on the\n"
+            "merged transcript. Bigger tiers give richer notes, slower.\n"
+            "Experimental models may be slow or fail on a 16 GB Mac.\n"
+            "Type any MLX repo id (e.g. from mlx-community) for other models."
         )
         model_row.addWidget(self.combo_notes_model, 1)
         self.star_notes_btn = self._make_star_button(

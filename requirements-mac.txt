@@ -21,7 +21,9 @@ onnx-asr[hub]==0.11.0
 onnxruntime==1.27.0
 mlx-whisper==0.4.3
 mlx-qwen3-asr[aligner]==0.3.5
-mlx-lm==0.31.3
+# 0.32+ loads Gemma 4 12B ("gemma4_unified"); it needs mlx >= 0.32.2, which
+# the Whisper and Qwen3-ASR engines share.
+mlx-lm==0.32.2
 psutil==7.2.2
 
 # Build and test only; excluded from the shipped bundle.

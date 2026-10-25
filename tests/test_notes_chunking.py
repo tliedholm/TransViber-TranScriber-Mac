@@ -309,3 +309,30 @@ def test_oversized_instructions_never_reach_generation(offline_run):
     assert worker.prompts == []
     assert worker.chunks == []  # not even the header
     assert "Shorten the AI instructions" in worker.failures[0]
+
+
+def test_a_huge_window_is_cut_to_the_pass_limit(offline_run):
+    # Qwen3.5 claims 262,144 tokens; one pass still holds MAX_PASS_TOKENS at
+    # most, so its KV cache stays within a 16 GB Mac.
+    transcript = "\n".join(words(40) for _ in range(2_500))  # 100,000 tokens
+    worker = RecordingWorker(transcript, "", "qwen3.5-9b")
+    offline_run(worker, context=262_144)
+    assert not worker.failures
+    assert len(worker.prompts) > 2
+    assert all(len(p) <= llm.prompt_limit(llm.MAX_PASS_TOKENS) for p in worker.prompts)
+
+
+def test_a_typical_session_is_one_pass_on_qwen3_5(offline_run):
+    transcript = "\n".join(words(40) for _ in range(1_250))  # 50,000 tokens
+    worker = RecordingWorker(transcript, "", "qwen3.5-9b")
+    offline_run(worker, context=262_144)
+    assert len(worker.prompts) == 1
+
+
+def test_gpt_oss_gets_the_smaller_pass(offline_run):
+    transcript = "\n".join(words(40) for _ in range(1_250))
+    worker = RecordingWorker(transcript, "", "gpt-oss-20b")
+    offline_run(worker, context=131_072)
+    assert not worker.failures
+    assert len(worker.prompts) > 2
+    assert all(len(p) <= llm.prompt_limit(32_768) for p in worker.prompts)

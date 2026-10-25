@@ -9,16 +9,30 @@ from PySide6.QtCore import QThread, Signal
 
 import diagnostics
 
-# UI tier names -> mlx-community 4-bit conversions, mirroring the PC app's
-# tiers (which use CUDA/bnb-4bit repos) at equivalent sizes.
+# UI tier names -> 4-bit MLX conversions. The 2024-25 entries mirror the PC
+# app's tiers (which use CUDA/bnb-4bit repos) at equivalent sizes; Qwen3.5,
+# Gemma 4 and gpt-oss are Mac-only so far. Each tier starts with its best
+# pick for a 16 GB Mac; the older models stay listed so a saved choice still
+# loads.
 NOTES_MODEL_GROUPS = [
-    ("Max Detail (Large Tier)", ["qwen3-14b", "gemma-3-12b", "mistral-nemo-12b"]),
+    ("Max Detail (Large Tier)", ["qwen3.5-9b", "gemma-4-12b", "qwen3-14b",
+                                 "gemma-3-12b", "mistral-nemo-12b"]),
     ("Standard Speed (Medium Tier)", ["qwen3-8b", "llama-3.1-8b", "ministral-8b"]),
-    ("Quick Review (Small Tier)", ["qwen3-4b", "llama-3.2-3b", "phi-4-mini",
-                                   "granite-3.3-2b"]),
+    ("Quick Review (Small Tier)", ["qwen3.5-4b", "qwen3-4b", "llama-3.2-3b",
+                                   "phi-4-mini", "granite-3.3-2b"]),
+    ("Experimental (tight on 16 GB)", ["gpt-oss-20b"]),
 ]
 
 LLM_REPOS = {
+    # Qwen3.5 (March 2026) keeps a full KV cache on only 8 of its 32 layers,
+    # about 33 MB per 1,000 tokens against ~164 MB for qwen3-14b, so a whole
+    # session fits one pass. These are mlx-vlm conversions; mlx-lm's qwen3_5
+    # loader drops the vision tower when it loads them.
+    "qwen3.5-9b": "mlx-community/Qwen3.5-9B-MLX-4bit",
+    # Gemma 4 12B (May 2026) needs mlx-lm >= 0.32 (its "gemma4_unified" type).
+    # LM Studio's build is 6.7 GB; mlx-community's qat-4bit is 11 GB because
+    # it keeps the feed-forward layers at 8-bit, too big for a 16 GB Mac.
+    "gemma-4-12b": "lmstudio-community/gemma-4-12B-it-MLX-4bit",
     "qwen3-14b": "mlx-community/Qwen3-14B-4bit",
     # Use the text-only conversion: the plain gemma-3 repo is a vision model
     # for mlx-vlm and cannot be loaded by this module's mlx-lm runtime.
@@ -27,13 +41,43 @@ LLM_REPOS = {
     "qwen3-8b": "mlx-community/Qwen3-8B-4bit",
     "llama-3.1-8b": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
     "ministral-8b": "mlx-community/Ministral-8B-Instruct-2410-4bit",
+    "qwen3.5-4b": "mlx-community/Qwen3.5-4B-MLX-4bit",
     "qwen3-4b": "mlx-community/Qwen3-4B-4bit",
     "llama-3.2-3b": "mlx-community/Llama-3.2-3B-Instruct-4bit",
     "phi-4-mini": "mlx-community/Phi-4-mini-instruct-4bit",
     "granite-3.3-2b": "mlx-community/granite-3.3-2b-instruct-4bit",
+    # 11.2 GB, the smallest MLX build there is (its experts ship as MXFP4), of
+    # the ~12.7 GB a 16 GB Mac lets the GPU use: see PASS_LIMITS.
+    "gpt-oss-20b": "mlx-community/gpt-oss-20b-MXFP4-Q4",
 }
 
-DEFAULT_NOTES_MODEL = "qwen3-4b"
+DEFAULT_NOTES_MODEL = "qwen3.5-4b"
+
+# Sampling per model family, as each family's model card recommends for
+# writing with thinking off: Qwen3.5 and Qwen3 for non-thinking mode, Gemma 4
+# from its card and generation_config, gpt-oss from OpenAI's README. First
+# match wins, so "qwen3.5" comes before "qwen3". Families not listed decode
+# greedily (mlx-lm's default), as every model did before.
+SAMPLING = (
+    ("qwen3.5", {"temp": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}),
+    ("qwen3", {"temp": 0.7, "top_p": 0.8, "top_k": 20}),
+    ("gemma-4", {"temp": 1.0, "top_p": 0.95, "top_k": 64}),
+    ("gpt-oss", {"temp": 1.0, "top_p": 1.0}),
+)
+
+# Reasoning written before the notes, as (opening, end-of-reasoning) markers.
+# Notes run with thinking off, but some models reason anyway: gpt-oss always
+# does (harmony format; it may also open straight on its final channel, which
+# ends at once), and the larger Gemma 4 models write an empty thought block
+# unless the template already did. Qwen's empty think block is in the prompt,
+# so it is listed only in case a model writes one regardless. Nothing before
+# the end marker reaches the notes. Gemma's "<|channel>" and harmony's
+# "<|channel|>" share a prefix; ReasoningFilter waits until they part.
+REASONING_MARKERS = (
+    ("<|channel|>", "<|channel|>final<|message|>"),  # gpt-oss
+    ("<|channel>", "<channel|>"),                    # Gemma 4
+    ("<think>", "</think>"),                         # Qwen3 / Qwen3.5
+)
 
 # The body wording is user-approved — change only on request. The tail
 # sections ('Where we left off', 'Unresolved threads') exist so the next
@@ -106,6 +150,17 @@ MAX_NOTES_TOKENS = 6_000  # generation cap per pass, also drives the percent
 DEFAULT_CONTEXT_TOKENS = 32_768
 CONTEXT_LIMITS = (2_048, 262_144)  # sanity clamp on whatever a model claims
 
+# The most one pass may hold, whatever window the model claims (pass_limit).
+# The whole prompt's KV cache sits in unified memory, and a 16 GB Mac lets the
+# GPU use about 12.7 GB of it. Qwen3.5 and Gemma 4 claim 262,144 tokens and
+# Llama 3.x 131,072: a full window of an ordinary-attention 8B model is about
+# 16 GB of cache on its own. At 65,536 the cache is about 2 GB for Qwen3.5-9B
+# and 1.4 GB for Gemma 4 12B, on top of 6-7 GB of weights, and one pass still
+# holds a typical session. gpt-oss-20b's weights alone take 11.2 GB of the
+# 12.7, so it gets half.
+MAX_PASS_TOKENS = 65_536
+PASS_LIMITS = (("gpt-oss", 32_768),)
+
 # Slack for tokenizer disagreement between counting content on its own and
 # counting it inside the whole prompt (merges across the seam, a BOS counted
 # with each piece). The chat template itself is measured, not guessed: see
@@ -152,14 +207,99 @@ def _get_llm(model_name: str, status_cb):
     return _llm_cache["model"], _llm_cache["tokenizer"]
 
 
+def _family(model_name: str) -> str:
+    """A model name or repo id, lowercased, with "gemma4" spelled "gemma-4"."""
+    return model_name.lower().replace("gemma4", "gemma-4")
+
+
+def sampling(model_name: str) -> dict:
+    """make_sampler() settings plus an optional presence_penalty (SAMPLING)."""
+    name = _family(model_name)
+    for family, settings in SAMPLING:
+        if family in name:
+            return dict(settings)
+    return {}
+
+
+def pass_limit(model_name: str) -> int:
+    """The most one pass of this model may hold (MAX_PASS_TOKENS, PASS_LIMITS)."""
+    name = _family(model_name)
+    for family, limit in PASS_LIMITS:
+        if family in name:
+            return limit
+    return MAX_PASS_TOKENS
+
+
+class ReasoningFilter:
+    """Streamed text with any leading reasoning block removed (REASONING_MARKERS).
+
+    Text is held back only while it could still be the start of a block, or
+    while a block is open. A reply that opens with anything else, and all
+    text after a block (less the blank lines that follow the block, however
+    the stream is cut), passes straight through.
+    """
+
+    def __init__(self):
+        self._held = ""
+        self._end = None  # end marker of the open block
+        self._passing = False
+        self._trim = False  # still dropping whitespace after a block
+        self.unfinished = False  # set by finish() when a block never ended
+
+    def feed(self, text: str) -> str:
+        if self._passing:
+            return self._shown(text)
+        self._held += text
+        if self._end is None:
+            start = self._held.lstrip()
+            if not start:
+                return ""
+            for opening, end in REASONING_MARKERS:
+                if start.startswith(opening):
+                    self._end = end
+                    break
+            else:
+                if any(opening.startswith(start) for opening, _ in REASONING_MARKERS):
+                    return ""  # could still become a marker
+                return self._release(self._held)
+        found = self._held.find(self._end)
+        if found < 0:
+            return ""
+        return self._release(self._held[found + len(self._end):], after_block=True)
+
+    def finish(self) -> str:
+        """Whatever is still held once generation ends."""
+        if self._passing:
+            return ""
+        if self._end is not None:
+            self.unfinished = True
+            return ""
+        return self._release(self._held)
+
+    def _release(self, text: str, after_block: bool = False) -> str:
+        self._passing = True
+        self._held = ""
+        self._trim = after_block
+        return self._shown(text)
+
+    def _shown(self, text: str) -> str:
+        if self._trim:
+            text = text.lstrip()
+            self._trim = not text
+        return text
+
+
 def _build_prompt(tokenizer, model_name: str, system_text: str, user_text: str) -> str:
     """Chat-template a system+user pair, handling per-family quirks."""
-    name = model_name.lower()
+    name = _family(model_name)
     kwargs = {}
-    if "qwen3" in name:
+    if "qwen3" in name or "gemma-4" in name:
         kwargs["enable_thinking"] = False  # notes, not chain-of-thought
-    if "gemma" in name:
-        # Gemma has no system role: fold the system text into the user turn.
+    if "gpt-oss" in name:
+        kwargs["reasoning_effort"] = "low"  # it always reasons; keep that short
+    if "gemma" in name and "gemma-4" not in name:
+        # Gemma 2 and 3 have no system role: fold the system text into the
+        # user turn. Gemma 4 has one.
         messages = [{"role": "user", "content": system_text + "\n\n" + user_text}]
     else:
         messages = [{"role": "system", "content": system_text},
@@ -178,8 +318,8 @@ def _request(tokenizer, model_name: str, system_text: str, user_text: str) -> li
     these ids, so what was counted is exactly what runs.
     """
     prompt = _build_prompt(tokenizer, model_name, system_text, user_text)
-    # stream_generate's own rule for a string prompt (mlx-lm 0.31.3): add the
-    # special tokens unless the template already starts with BOS.
+    # stream_generate's own rule for a string prompt (mlx-lm 0.31.3 and 0.32.2):
+    # add the special tokens unless the template already starts with BOS.
     bos = getattr(tokenizer, "bos_token", None)
     return list(tokenizer.encode(
         prompt, add_special_tokens=bos is None or not prompt.startswith(bos)))
@@ -191,8 +331,14 @@ def prompt_limit(context: int) -> int:
 
 
 def context_window(model, tokenizer) -> int:
-    """The model's context length, clamped to something believable."""
+    """The model's context length, clamped to something believable.
+
+    Multimodal checkpoints (Qwen3.5, Gemma 4) keep the text model's settings
+    a level down, on model.language_model.args.
+    """
+    text_model = getattr(model, "language_model", None)
     for source, attribute in ((getattr(model, "args", None), "max_position_embeddings"),
+                              (getattr(text_model, "args", None), "max_position_embeddings"),
                               (getattr(model, "config", None), "max_position_embeddings"),
                               (tokenizer, "model_max_length")):
         value = getattr(source, attribute, None)
@@ -317,30 +463,52 @@ class NotesWorker(QThread):
             raise ValueError(
                 f"The AI instructions are too long for this notes model. With "
                 f"them in, a prompt has room for {max(0, room):,} tokens of "
-                f"transcript out of the {prompt_limit(context):,} the model can "
-                f"read at once, and it needs at least {MIN_PROMPT_TOKENS:,}. "
+                f"transcript out of the {prompt_limit(context):,} one pass can "
+                f"hold, and it needs at least {MIN_PROMPT_TOKENS:,}. "
                 f"Shorten the AI instructions, or choose a notes model with a "
                 f"larger context.")
         return budgets
 
     def _generate(self, model, tokenizer, prompt: list[int], stream: bool) -> str:
-        """One generation pass over _request() ids; streams to the editor if `stream`."""
-        from mlx_lm import stream_generate
+        """One generation pass over _request() ids; streams to the editor if `stream`.
 
+        Any reasoning the model writes first is dropped (ReasoningFilter), from
+        the returned notes as well as from the editor.
+        """
+        from mlx_lm import stream_generate
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+        settings = sampling(self.model_name)
+        penalty = settings.pop("presence_penalty", None)
+        visible = ReasoningFilter()
         pieces = []
-        for response in stream_generate(model, tokenizer, prompt,
-                                        max_tokens=MAX_NOTES_TOKENS):
+        for response in stream_generate(
+                model, tokenizer, prompt, max_tokens=MAX_NOTES_TOKENS,
+                sampler=make_sampler(**settings),
+                logits_processors=make_logits_processors(presence_penalty=penalty)):
             if self._stop:
                 break
-            pieces.append(response.text)
-            if stream:
-                self.chunk.emit(response.text)
+            text = visible.feed(response.text)
+            if text:
+                pieces.append(text)
+                if stream:
+                    self.chunk.emit(text)
             self._tokens += 1
             # mlx-lm reports decode speed itself; excludes prompt processing.
             self._last_tps = response.generation_tps
             frac = min(self._tokens - self._pass_base, MAX_NOTES_TOKENS) / MAX_NOTES_TOKENS
             percent = int((self._passes_done + min(frac, 0.99)) / self._passes_total * 100)
             self.progress.emit(min(percent, 99), self._tokens, self._last_tps)
+        rest = visible.finish()
+        if rest:
+            pieces.append(rest)
+            if stream:
+                self.chunk.emit(rest)
+        if visible.unfinished and not self._stop:
+            raise RuntimeError(
+                f"The notes model stopped before it finished reasoning, so it "
+                f"wrote no notes (a pass may write {MAX_NOTES_TOKENS:,} tokens, "
+                f"reasoning included). Try again, or choose another notes model.")
         self._passes_done += 1
         self._pass_base = self._tokens
         return "".join(pieces)
@@ -415,7 +583,7 @@ class NotesWorker(QThread):
             free_asr_models()
             model, tokenizer = _get_llm(self.model_name, self.status.emit)
 
-            context = context_window(model, tokenizer)
+            context = min(context_window(model, tokenizer), pass_limit(self.model_name))
             # Before the header, so instructions that can't fit fail the run
             # with nothing written to the notes.
             _, part_budget, final_budget, merge_budget = self._budgets(tokenizer, context)
