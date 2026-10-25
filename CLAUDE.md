@@ -108,10 +108,16 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   model caches are mutually exclusive to protect unified memory.
   Every pass is budgeted against the model's real context window
   (`context_window()` reads `model.args.max_position_embeddings` — 40,960
-  for Qwen3 — and never trusts `tokenizer.model_max_length` alone), minus
-  the whole request and `MAX_NOTES_TOKENS` of output. What a pass carries
+  for Qwen3 — then `model.language_model.args`, where multimodal
+  checkpoints such as Qwen3.5 and Gemma 4 keep it, and never trusts
+  `tokenizer.model_max_length` alone), capped by `pass_limit()`
+  (`MAX_PASS_TOKENS`, 65,536; 32,768 for gpt-oss), minus the whole request
+  and `MAX_NOTES_TOKENS` of output. The cap is for memory, not the model:
+  the whole prompt's KV cache sits in unified memory, and a 16 GB Mac gives
+  the GPU about 12.7 GB. What a pass carries
   besides its content (system text, user instructions, chat template,
-  Qwen3's thinking switch, Gemma's folded system turn) is measured once a
+  Qwen3's and Gemma 4's thinking switch, gpt-oss's reasoning effort, Gemma
+  2/3's folded system turn) is measured once a
   run by building that pass with empty content through `_request()`, the
   same builder generation uses. `stream_generate` is handed `_request()`'s
   ids, so what was counted is what runs; the direct prompt is counted whole
@@ -133,6 +139,16 @@ to stay compatible with Windows, but the user may ask to port fixes across.
   session knows where to pick up. Part passes use `PART_PROMPT`, which
   omits those tail sections — a middle part's ending is not the session's
   — and only the final/combine pass emits them.
+  Catalog (`NOTES_MODEL_GROUPS`/`LLM_REPOS`): each tier starts with its pick
+  for a 16 GB Mac (Qwen3.5-9B, Qwen3.5-4B as default; Gemma 4 12B, which
+  needs mlx-lm >= 0.32; gpt-oss-20b as Experimental). Older entries stay so
+  saved settings load. Sampling follows each family's model card
+  (`SAMPLING`); families not listed decode greedily. Some models reason
+  before writing even with thinking off (gpt-oss always; Gemma 4 may write
+  an empty thought block): `ReasoningFilter` keeps everything up to the end
+  of a leading reasoning block (`REASONING_MARKERS`) out of the editor and
+  the part notes, and a pass that never finishes reasoning fails rather
+  than writing nothing.
 - `stats.py` — `StatsPoller` QThread feeding the status-bar utilization
   label (GPU/CPU/RAM every 2 s). GPU % is parsed from
   `ioreg -c IOAccelerator` ("Device Utilization %", whole-system, no sudo);

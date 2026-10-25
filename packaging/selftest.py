@@ -40,6 +40,10 @@ def check_bundle() -> list[str]:
     modules = [
         "av", "numpy", "psutil", "faster_whisper", "faster_whisper.vad",
         "ctranslate2", "mlx.core", "mlx_whisper", "mlx_qwen3_asr", "mlx_lm",
+        # mlx-lm imports a model's architecture by name only when it loads, so
+        # a bundle missing one would fail only once someone picked that model.
+        "mlx_lm.sample_utils", "mlx_lm.models.qwen3", "mlx_lm.models.qwen3_5",
+        "mlx_lm.models.gemma4", "mlx_lm.models.gemma4_text", "mlx_lm.models.gpt_oss",
         "onnx_asr", "onnxruntime", "transformers", "huggingface_hub",
         "tqdm.std", "certifi", "tiktoken", "numba",
         "main_window", "llm", "stats", "audio", "align", "merger", "exporters",
@@ -154,12 +158,13 @@ try:
     import llm
 
     from mlx_lm import load
-    model, tok = load(llm.LLM_REPOS["qwen3-4b"])
+    name = llm.DEFAULT_NOTES_MODEL
+    model, tok = load(llm.LLM_REPOS[name])
     notes_ok = model is not None and tok is not None
-    context = llm.context_window(model, tok)
+    context = min(llm.context_window(model, tok), llm.pass_limit(name))
     # Sizes every pass through the real chat template, as a notes run does.
-    room = min(llm.NotesWorker("", "", "qwen3-4b")._budgets(tok, context))
-    print(f"loaded qwen3-4b OK (context {context}, {room:,} tokens of "
+    room = min(llm.NotesWorker("", "", name)._budgets(tok, context))
+    print(f"loaded {name} OK (context {context}, {room:,} tokens of "
           f"transcript per pass)")
     del model, tok
 except Exception:
